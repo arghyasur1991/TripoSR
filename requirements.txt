@@ -10,3 +10,9 @@ imageio[ffmpeg]
 gradio
 xatlas==0.0.9
 moderngl==5.10.0
+
+# Quest optimization dependencies (export_onnx.py, reconstruct_compare.py)
+scipy
+onnxruntime
+onnxscript
+onnxconverter-common
