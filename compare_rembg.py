@@ -39,7 +39,7 @@ def preprocess_for_rembg(image: Image.Image) -> np.ndarray:
     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-    img = image.convert("RGB").resize((320, 320), Image.BILINEAR)
+    img = image.convert("RGB").resize((320, 320), Image.LANCZOS)
     arr = np.array(img, dtype=np.float32) / 255.0  # HWC [0,1]
 
     # CHW layout
@@ -117,19 +117,25 @@ def run_rembg_onnx(image_path: Path, output_dir: Path):
 
 
 def save_composite(image: Image.Image, mask_320: np.ndarray, output_dir: Path):
-    """Run rembg mask → RGBA → resize_foreground → composite → save."""
+    """Run rembg mask → RGBA → resize_foreground → composite → save.
+
+    Binarizes the mask at 0.5 before creating RGBA, matching rembg's
+    post_process_mask behavior. This keeps a tight bbox that maximizes
+    object resolution in the final 512x512 frame.
+    """
     w, h = image.size
 
-    # Upscale mask to original image size
+    # Upscale mask to original image size (LANCZOS matches rembg library)
     mask_pil = Image.fromarray((mask_320 * 255).astype(np.uint8))
-    mask_full = mask_pil.resize((w, h), Image.BILINEAR)
+    mask_full = mask_pil.resize((w, h), Image.LANCZOS)
     mask_arr = np.array(mask_full, dtype=np.float32) / 255.0
 
-    # Create RGBA image
+    # Binarize alpha at 0.5 — soft edges inflate the bbox and shrink the
+    # object in the final 512x512 frame, degrading TripoSR quality.
     rgb = np.array(image.convert("RGB"), dtype=np.float32)
     rgba = np.zeros((h, w, 4), dtype=np.float32)
     rgba[:, :, :3] = rgb
-    rgba[:, :, 3] = mask_arr * 255.0
+    rgba[:, :, 3] = (mask_arr > 0.5).astype(np.float32) * 255.0
     rgba_img = Image.fromarray(rgba.astype(np.uint8), "RGBA")
 
     # resize_foreground (match TripoSR pipeline)
@@ -185,10 +191,53 @@ def compare_masks(python_mask: np.ndarray, unity_mask_path: Path):
     print(f"Python fg pixels: {py_fg.sum()}, Unity fg pixels: {u_fg.sum()}")
 
 
+def compare_composites(python_composite_path: Path, unity_composite_path: Path):
+    """Pixel-level comparison of Python vs Unity 512x512 composites."""
+    py_img = Image.open(python_composite_path).convert("RGB")
+    u_img = Image.open(unity_composite_path).convert("RGB")
+
+    py_arr = np.array(py_img, dtype=np.float32) / 255.0
+    u_arr = np.array(u_img, dtype=np.float32) / 255.0
+
+    if py_arr.shape != u_arr.shape:
+        print(f"\nComposite shape mismatch: Python={py_arr.shape}, Unity={u_arr.shape}")
+        u_img = u_img.resize((py_arr.shape[1], py_arr.shape[0]), Image.BILINEAR)
+        u_arr = np.array(u_img, dtype=np.float32) / 255.0
+
+    diff = np.abs(py_arr - u_arr)
+    print(f"\n--- Composite Comparison (512x512 RGB) ---")
+    print(f"Python:  mean={py_arr.mean():.4f}, range=[{py_arr.min():.4f}, {py_arr.max():.4f}]")
+    print(f"Unity:   mean={u_arr.mean():.4f}, range=[{u_arr.min():.4f}, {u_arr.max():.4f}]")
+    print(f"Diff:    max={diff.max():.4f}, mean={diff.mean():.4f}")
+
+    per_pixel = diff.max(axis=2)  # max across RGB channels
+    print(f"Pixels > 0.05 diff: {(per_pixel > 0.05).sum()} / {per_pixel.size} "
+          f"({100 * (per_pixel > 0.05).mean():.1f}%)")
+    print(f"Pixels > 0.10 diff: {(per_pixel > 0.10).sum()} / {per_pixel.size} "
+          f"({100 * (per_pixel > 0.10).mean():.1f}%)")
+
+    flat_py = py_arr.flatten()
+    flat_u = u_arr.flatten()
+    cos_sim = np.dot(flat_py, flat_u) / (np.linalg.norm(flat_py) * np.linalg.norm(flat_u) + 1e-8)
+    print(f"Cosine similarity: {cos_sim:.6f}")
+
+    # RMSE
+    rmse = np.sqrt(np.mean(diff ** 2))
+    print(f"RMSE: {rmse:.6f}")
+
+    # Save diff heatmap
+    diff_vis = (per_pixel * 10).clip(0, 1)  # amplify 10x for visibility
+    diff_img = Image.fromarray((diff_vis * 255).astype(np.uint8))
+    diff_path = python_composite_path.parent / "composite_diff_heatmap.png"
+    diff_img.save(diff_path)
+    print(f"Saved diff heatmap (10x amplified): {diff_path}")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Compare rembg masks: ONNX vs Unity")
+    parser = argparse.ArgumentParser(description="Compare rembg masks and composites: ONNX vs Unity")
     parser.add_argument("--image", type=Path, required=True, help="Input image (raw, no bg removal)")
     parser.add_argument("--unity-mask", type=Path, help="Unity rembg mask PNG for comparison")
+    parser.add_argument("--unity-composite", type=Path, help="Unity 512x512 composite PNG for comparison")
     parser.add_argument("--output-dir", type=Path, default=DEBUG_DIR, help="Output directory")
     args = parser.parse_args()
 
@@ -196,6 +245,10 @@ def main():
 
     if args.unity_mask:
         compare_masks(mask, args.unity_mask)
+
+    python_composite = args.output_dir / "python_rembg_composite.png"
+    if args.unity_composite:
+        compare_composites(python_composite, args.unity_composite)
 
 
 if __name__ == "__main__":
