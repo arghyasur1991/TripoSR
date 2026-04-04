@@ -167,4 +167,5 @@ outputs/
 models/*.onnx
 models/*.onnx.data
 test_images/novel/*_raw.*
+debug_output/
 .DS_Store
