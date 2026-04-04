@@ -290,3 +290,61 @@ ONNX conversion introduces no additional quality degradation beyond what ToMe it
 | ToMe FP32 ONNX (CPU) | 2527ms | ~5.5s | 1676 MB | CD=0.72%, 1 fail | MEASURED |
 | **ToMe FP16 ONNX (CPU)** | 3063ms | **~2.5-2.7s** | **838 MB** | **CD=0.71%, 1 fail** | **SPEED OPTION** |
 | ToMe INT8 ONNX (CPU) | 2493ms | ~1.4-2.0s | 436 MB | CD=0.71%, 1 fail | NEEDS VALIDATION |
+
+---
+
+## Phase 6: ONNX Graph Optimization (opt_level=1)
+
+**Date:** 2026-04-04
+**Implementation:** `optimize_graph()` in `export_onnx.py` — ORT basic graph optimization
+(constant folding, dead node elimination, common subexpression elimination).
+Uses only standard ONNX-compatible transforms; no ORT-specific fused operators.
+
+### Graph Node Reduction
+
+| Model | Pre-Opt Nodes | Post-Opt Nodes | Reduction | Notes |
+|---|---|---|---|---|
+| **triposr_fp32.onnx** | 4667 | 2662 | **-43.0%** (2005 nodes eliminated) | Constant folding dominates |
+| **nerf_decoder.onnx** | 28 | 28 | 0% | Already minimal |
+| **u2netp.onnx** | 1055 | 371 | **-64.8%** (684 nodes eliminated) | Significant cleanup |
+
+### File Sizes
+
+| Model | Pre-Opt Size | Post-Opt Size | Change |
+|---|---|---|---|
+| triposr_fp32.onnx | 1675.5 MB | 1675.2 MB | -0.3 MB (constants folded, metadata reduced) |
+| nerf_decoder.onnx | 0.17 MB | 0.17 MB | No change |
+| u2netp.onnx | 4.6 MB | 4.5 MB | -0.1 MB |
+
+### Quality Verification (graph-optimized FP32 + decoder, 20-image test set)
+
+| Metric | Value |
+|---|---|
+| Mean Chamfer Distance | 0.471% |
+| Mean F-Score @1% | 96.7 |
+| Mean F-Score @2% | 100.0 |
+| Vertex Ratio | 1.00x |
+| Mean Latency (ORT CPU) | 2.683s |
+| **Overall** | **20/20 PASS** |
+
+No quality degradation from graph optimization — results are numerically identical
+to pre-optimized models since only redundant/constant nodes were eliminated.
+
+### Impact on Unity Sentis Import
+
+Fewer graph nodes means:
+- **Faster model loading** — Sentis parses fewer ops during `ModelLoader.Load()`
+- **Lower peak memory** — eliminated constant subgraphs don't allocate intermediate tensors
+- **Faster `ScheduleIterable` dispatch** — fewer layers to schedule across frames
+- Cleaner graph aids debugging in Sentis model inspector
+
+### Models Deployed to Unity
+
+Three optimized ONNX files placed in `SentienceUnity/Assets/Game/ObjectReconstruction/OnnxSource/`:
+
+| File | Size | Purpose |
+|---|---|---|
+| `triposr_fp32.onnx` | 1675.2 MB | Main model (Sentis quantizes to Uint8/FP16 at convert time) |
+| `nerf_decoder.onnx` | 0.17 MB | NeRF MLP decoder |
+| `u2netp.onnx` | 4.5 MB | Background removal |
+| **Total** | **~1.68 GB** | Pre-conversion (wizard converts to <500MB .sentis) |

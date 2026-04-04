@@ -56,15 +56,13 @@ def process_directory(input_dir: Path, session=None):
 
 def export_u2netp_onnx(output_dir: Path):
     """Export the u2netp ONNX model file for on-device deployment."""
-    import onnxruntime as ort
+    import shutil
     from rembg.sessions import U2netpSession
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    sess = U2netpSession.from_pretrained("u2netp")
-    src = Path(sess.inner_session._model_path)
+    src = Path(U2netpSession.download_models())
     dst = output_dir / "u2netp.onnx"
 
-    import shutil
     shutil.copy2(src, dst)
     print(f"Exported u2netp ONNX model to {dst} ({dst.stat().st_size / 1e6:.1f} MB)")
 
