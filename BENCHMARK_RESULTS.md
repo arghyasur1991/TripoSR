@@ -150,18 +150,62 @@ cross-attention savings). **Dropped from the optimization stack.**
 
 ## Phase 4: ONNX Export + Quantization
 
-*(To be filled)*
+**Date:** 2026-04-04
+**Implementation:** `export_onnx.py` -- legacy TorchScript exporter, opset 15
+**Export:** `TripoSRForward` wrapper (image -> scene_codes) + `DecoderWrapper` (NeRF MLP)
+
+### Model Sizes
+
+| Variant | Size | vs FP32 |
+|---|---|---|
+| FP32 | 1675.5 MB | 100% |
+| FP16 (ORT optimizer) | 838.2 MB | 50% |
+| INT8 (dynamic, MatMul only) | 435.5 MB | 26% |
+| NeRF Decoder FP32 | 0.17 MB | -- |
+
+### Accuracy vs PyTorch Reference
+
+| Variant | Max Relative Error | Mean Relative Error | Status |
+|---|---|---|---|
+| FP32 | 0.0003% | 0.0000% | PASS |
+| FP16 | 0.185% | 0.009% | PASS |
+| INT8 | 4.90% | 0.30% | WARN (acceptable) |
+| Decoder FP32 | 0.000% | 0.000% | PASS |
+
+### Speed (ORT CPUExecutionProvider, M4 Max)
+
+| Variant | Mean (s) | vs FP32 |
+|---|---|---|
+| ORT FP32 | 2.745 | 1.00x |
+| ORT FP16 | 3.064 | 0.90x (slower -- CPU has no native FP16) |
+| ORT INT8 | 2.522 | 1.09x |
+
+Note: ORT CPU is ~5x slower than PyTorch MPS (0.53s) since it doesn't use the GPU.
+CoreML EP was tested but crashes on models this large.
+
+### Quest 3 Estimates
+
+Quest 3 uses Snapdragon XR2 Gen 2 GPU via NNAPI/QNN execution provider.
+M4 Max GPU bandwidth: ~546 GB/s, XR2 GPU bandwidth: ~51 GB/s (ratio ~11x).
+Transformer inference is bandwidth-bound, so FP16 halves the bandwidth requirement.
+
+| Variant | Quest 3 GPU est. | Notes |
+|---|---|---|
+| FP32 (baseline) | ~6.2s | Same as PyTorch estimate (bandwidth-bound) |
+| FP16 | ~3.1s | Half the bandwidth of FP32 |
+| INT8 | ~1.6-2.5s | 4x less bandwidth, but mobile INT8 GPU support varies |
+
+**FP16 ONNX is the primary deployment target: ~3s forward on Quest 3.** INT8 may
+further improve this but needs on-device validation (mobile INT8 GPU support is spotty).
 
 ---
 
 ## Cumulative Results Summary
 
-| Variant | Forward (M4 Max) | Quest 3 est. | CD (%) | F@1% | F@2% | Status |
-|---|---|---|---|---|---|---|
-| Baseline (PyTorch) | 560ms | ~6.2s | 0 (ref) | 100 (ref) | 100 (ref) | MEASURED |
-| + ToMe r=0.1 | 450ms | ~5.0s | 0.71 | 84.3 | 97.3 | BEST PYTORCH |
-| + ToMe r=0.2 | 375ms | ~4.1s | 1.04 | 63.1 | 90.5 | TOO AGGRESSIVE |
-| + Image token pruning 0.5 | 486ms | ~5.3s | 0.90 | 76.3 | 93.9 | NOT WORTH IT |
-| ONNX FP32 | TBD | TBD | TBD | TBD | TBD | PENDING |
-| ONNX FP16 | TBD | TBD | TBD | TBD | TBD | PENDING |
-| ONNX INT8 | TBD | TBD | TBD | TBD | TBD | PENDING |
+| Variant | Forward (M4 Max) | Quest 3 est. | Size | Accuracy | Status |
+|---|---|---|---|---|---|
+| Baseline (PyTorch MPS) | 525ms | ~5.8s | -- | reference | MEASURED |
+| + ToMe r=0.1 (PyTorch) | 450ms | ~5.0s | -- | CD=0.71% | BEST PYTORCH |
+| ONNX FP32 (CPU) | 2745ms | ~6.2s | 1676 MB | 0.0003% err | MEASURED |
+| ONNX FP16 (CPU) | 3064ms | **~3.1s** | 838 MB | 0.185% err | **DEPLOY TARGET** |
+| ONNX INT8 (CPU) | 2522ms | ~1.6-2.5s | 436 MB | 4.9% err | NEEDS DEVICE TEST |
