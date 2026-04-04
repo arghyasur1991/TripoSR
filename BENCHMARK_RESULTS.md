@@ -194,6 +194,20 @@ CoreML EP was tested but crashes on models this large.
 **FP16 is essentially lossless** — same quality as FP32 across all 20 test images.
 INT8 has 3 marginal cases (teapot, mug, vase) but no failures.
 
+### Full ONNX Pipeline Validation (ONNX forward + ONNX NeRF decoder for mesh extraction)
+
+This validates the complete deployment pipeline: ONNX main model outputs scene_codes,
+ONNX NeRF decoder (`nerf_decoder.onnx`, 0.17 MB FP32) replaces PyTorch decoder for
+triplane querying and mesh extraction. Grid sampling stays in PyTorch/C++ (will be C# on Quest).
+
+| Variant | Mean CD (%) | Mean F@1% | Mean F@2% | Failures | Marginals | Overall |
+|---|---|---|---|---|---|---|
+| **FP32 + Decoder** | 0.471 | 96.6 | 100.0 | 0/20 | 0/20 | **ALL PASS** |
+| **FP16 + Decoder** | 0.471 | 96.5 | 100.0 | 0/20 | 0/20 | **ALL PASS** |
+
+**Full ONNX pipeline produces identical quality to PyTorch baseline.** The NeRF decoder ONNX
+model (170 KB) is deployment-ready — no quality loss from ONNX conversion of the decoder MLP.
+
 ### Quest 3 Estimates
 
 Quest 3 uses Snapdragon XR2 Gen 2 GPU via NNAPI/QNN execution provider.
@@ -220,3 +234,5 @@ further improve this but needs on-device validation (mobile INT8 GPU support is 
 | ONNX FP32 (CPU) | 2745ms | ~6.2s | 1676 MB | CD=0.47%, 20/20 PASS | MEASURED |
 | **ONNX FP16 (CPU)** | 3064ms | **~3.1s** | **838 MB** | **CD=0.47%, 20/20 PASS** | **DEPLOY TARGET** |
 | ONNX INT8 (CPU) | 2522ms | ~1.6-2.5s | 436 MB | CD=0.56%, 3 marginal | BACKUP OPTION |
+| FP32 + ONNX decoder (full pipeline) | -- | -- | 1676+0.17 MB | CD=0.47%, 20/20 PASS | VALIDATED |
+| **FP16 + ONNX decoder (full pipeline)** | -- | -- | **838+0.17 MB** | **CD=0.47%, 20/20 PASS** | **VALIDATED** |

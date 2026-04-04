@@ -100,26 +100,132 @@ def _preprocess_for_onnx(image_path: Path) -> np.ndarray:
     return rgb.permute(0, 3, 1, 2).numpy()  # (B, C, H, W)
 
 
+def _onnx_forward(onnx_session, image_path: Path) -> np.ndarray:
+    """Run ONNX forward pass, return scene_codes as numpy."""
+    img_np = _preprocess_for_onnx(image_path)
+    input_meta = onnx_session.get_inputs()[0]
+    if input_meta.type == "tensor(float16)":
+        img_np = img_np.astype(np.float16)
+    return onnx_session.run(None, {"image": img_np})[0].astype(np.float32)
+
+
 def run_onnx_inference(
     onnx_session,
     model: TSR,
     image_path: Path,
     device: str,
+    decoder_session=None,
 ) -> trimesh.Trimesh:
-    """Run ONNX forward pass for scene_codes, then PyTorch mesh extraction."""
-    img_np = _preprocess_for_onnx(image_path)
+    """Run ONNX forward pass for scene_codes, then mesh extraction.
 
-    input_meta = onnx_session.get_inputs()[0]
-    if input_meta.type == "tensor(float16)":
-        img_np = img_np.astype(np.float16)
+    If decoder_session is provided, uses ONNX decoder for density/color queries
+    (full ONNX pipeline). Otherwise falls back to PyTorch decoder.
+    """
+    scene_codes_np = _onnx_forward(onnx_session, image_path)
+    scene_codes = torch.from_numpy(scene_codes_np).to(device)
 
-    scene_codes_np = onnx_session.run(None, {"image": img_np})[0]
-    scene_codes = torch.from_numpy(scene_codes_np.astype(np.float32)).to(device)
+    if decoder_session is not None:
+        return _extract_mesh_onnx_decoder(model, scene_codes, decoder_session, device)
 
     with torch.no_grad():
         model.set_marching_cubes_resolution(256)
         meshes = model.extract_mesh(scene_codes, has_vertex_color=True, resolution=256)
     return meshes[0]
+
+
+def _extract_mesh_onnx_decoder(
+    model: TSR,
+    scene_codes: torch.Tensor,
+    decoder_session,
+    device: str,
+    resolution: int = 256,
+    threshold: float = 25.0,
+) -> trimesh.Trimesh:
+    """Extract mesh using ONNX decoder instead of PyTorch decoder.
+
+    Replicates TSR.extract_mesh but swaps the decoder MLP call with ONNX inference.
+    The triplane grid_sample and marching cubes stay in PyTorch/CPU.
+    """
+    import torch.nn.functional as F
+    from einops import rearrange
+    from tsr.models.isosurface import MarchingCubeHelper
+    from tsr.utils import scale_tensor
+
+    model.set_marching_cubes_resolution(resolution)
+    renderer = model.renderer
+    helper = model.isosurface_helper
+
+    scene_code = scene_codes[0]  # single image
+
+    def query_triplane_onnx(positions, triplane):
+        """Grid-sample triplane features, then run ONNX decoder."""
+        input_shape = positions.shape[:-1]
+        positions = positions.view(-1, 3)
+        positions = scale_tensor(
+            positions, (-renderer.cfg.radius, renderer.cfg.radius), (-1, 1)
+        )
+
+        indices2D = torch.stack(
+            (positions[..., [0, 1]], positions[..., [0, 2]], positions[..., [1, 2]]),
+            dim=-3,
+        )
+        out = F.grid_sample(
+            rearrange(triplane, "Np Cp Hp Wp -> Np Cp Hp Wp", Np=3),
+            rearrange(indices2D, "Np N Nd -> Np () N Nd", Np=3),
+            align_corners=False,
+            mode="bilinear",
+        )
+        features = rearrange(out, "Np Cp () N -> N (Np Cp)", Np=3)
+
+        # ONNX decoder: (N, 120) -> (N, 4) = [density, r, g, b]
+        feat_np = features.cpu().numpy()
+        chunk_size = 65536
+        results = []
+        for i in range(0, feat_np.shape[0], chunk_size):
+            chunk = feat_np[i:i+chunk_size]
+            result = decoder_session.run(None, {"triplane_features": chunk})[0]
+            results.append(result)
+        raw = np.concatenate(results, axis=0)
+        raw = torch.from_numpy(raw).to(device)
+
+        density = raw[..., 0:1]
+        color_features = raw[..., 1:4]
+
+        from tsr.utils import get_activation
+        density_act = get_activation(renderer.cfg.density_activation)(
+            density + renderer.cfg.density_bias
+        )
+        color = get_activation(renderer.cfg.color_activation)(color_features)
+
+        return {
+            "density_act": density_act.view(*input_shape, -1),
+            "color": color.view(*input_shape, -1),
+        }
+
+    with torch.no_grad():
+        grid_verts = scale_tensor(
+            helper.grid_vertices.to(device),
+            helper.points_range,
+            (-renderer.cfg.radius, renderer.cfg.radius),
+        )
+        density_result = query_triplane_onnx(grid_verts, scene_code)
+        density = density_result["density_act"]
+
+    v_pos, t_pos_idx = helper(-(density - threshold))
+    v_pos = scale_tensor(
+        v_pos, helper.points_range,
+        (-renderer.cfg.radius, renderer.cfg.radius),
+    )
+
+    with torch.no_grad():
+        color_result = query_triplane_onnx(v_pos, scene_code)
+        color = color_result["color"]
+
+    return trimesh.Trimesh(
+        vertices=v_pos.cpu().numpy(),
+        faces=t_pos_idx.cpu().numpy(),
+        vertex_colors=color.cpu().numpy(),
+    )
 
 
 def time_onnx_inference(onnx_session, image_path: Path, n_runs: int = 5) -> float:
@@ -371,12 +477,22 @@ def run_onnx_variant(
     variant_name: str,
     test_images: list[Path],
     measure_latency: bool = True,
+    decoder_path: Path | None = None,
 ) -> list[dict]:
-    """Run an ONNX variant on all test images and compare to cached baseline."""
+    """Run an ONNX variant on all test images and compare to cached baseline.
+
+    If decoder_path is provided, the decoder ONNX model is used for mesh extraction
+    (full ONNX pipeline validation), otherwise PyTorch decoder is used.
+    """
     import onnxruntime as ort
 
     print(f"  Loading ONNX: {onnx_path.name}")
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+
+    decoder_session = None
+    if decoder_path is not None:
+        print(f"  Loading decoder ONNX: {decoder_path.name}")
+        decoder_session = ort.InferenceSession(str(decoder_path), providers=["CPUExecutionProvider"])
 
     results = []
     for img_path in test_images:
@@ -389,7 +505,9 @@ def run_onnx_variant(
             continue
         baseline_mesh = trimesh.load(str(baseline_path), process=False)
 
-        variant_mesh = run_onnx_inference(session, model, img_path, device)
+        variant_mesh = run_onnx_inference(
+            session, model, img_path, device, decoder_session=decoder_session
+        )
         metrics = compute_metrics(baseline_mesh, variant_mesh)
 
         latency = None
@@ -445,6 +563,7 @@ def main():
     parser.add_argument("--tome-layers", nargs="+", type=int, default=[4, 8, 12], help="ToMe merge layers")
     parser.add_argument("--image-prune", nargs="+", type=float, help="Test image token pruning at given ratios")
     parser.add_argument("--onnx", nargs="+", type=Path, help="Test ONNX model variant(s)")
+    parser.add_argument("--onnx-decoder", type=Path, help="Decoder ONNX model for full-pipeline validation")
     parser.add_argument("--all", action="store_true", help="Run all available variants")
     parser.add_argument("--device", default="auto", help="Device: auto, cpu, mps, cuda")
     parser.add_argument("--no-latency", action="store_true", help="Skip latency measurement")
@@ -525,10 +644,13 @@ def main():
 
     for onnx_path in onnx_variants:
         name = f"onnx_{onnx_path.stem}"
+        if args.onnx_decoder:
+            name += "+decoder"
         print(f"\n--- Variant: {name} ---")
         results = run_onnx_variant(
             onnx_path, model, device, name, test_images,
             measure_latency=not args.no_latency,
+            decoder_path=args.onnx_decoder,
         )
         if results:
             report = format_report(name, results)
