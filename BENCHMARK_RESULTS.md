@@ -183,6 +183,17 @@ cross-attention savings). **Dropped from the optimization stack.**
 Note: ORT CPU is ~5x slower than PyTorch MPS (0.53s) since it doesn't use the GPU.
 CoreML EP was tested but crashes on models this large.
 
+### Reconstruction Quality (20-image test set, meshes via ONNX scene_codes + PyTorch decoder)
+
+| Variant | Mean CD (%) | Mean F@1% | Mean F@2% | Failures | Marginals | Overall |
+|---|---|---|---|---|---|---|
+| **ONNX FP32** | 0.470 | 96.6 | 100.0 | 0/20 | 0/20 | **ALL PASS** |
+| **ONNX FP16** | 0.471 | 96.6 | 100.0 | 0/20 | 0/20 | **ALL PASS** |
+| ONNX INT8 | 0.558 | 92.5 | 98.5 | 0/20 | 3/20 | MARGINAL |
+
+**FP16 is essentially lossless** — same quality as FP32 across all 20 test images.
+INT8 has 3 marginal cases (teapot, mug, vase) but no failures.
+
 ### Quest 3 Estimates
 
 Quest 3 uses Snapdragon XR2 Gen 2 GPU via NNAPI/QNN execution provider.
@@ -202,10 +213,10 @@ further improve this but needs on-device validation (mobile INT8 GPU support is 
 
 ## Cumulative Results Summary
 
-| Variant | Forward (M4 Max) | Quest 3 est. | Size | Accuracy | Status |
+| Variant | Forward (M4 Max) | Quest 3 est. | Size | Quality (20 imgs) | Status |
 |---|---|---|---|---|---|
 | Baseline (PyTorch MPS) | 525ms | ~5.8s | -- | reference | MEASURED |
-| + ToMe r=0.1 (PyTorch) | 450ms | ~5.0s | -- | CD=0.71% | BEST PYTORCH |
-| ONNX FP32 (CPU) | 2745ms | ~6.2s | 1676 MB | 0.0003% err | MEASURED |
-| ONNX FP16 (CPU) | 3064ms | **~3.1s** | 838 MB | 0.185% err | **DEPLOY TARGET** |
-| ONNX INT8 (CPU) | 2522ms | ~1.6-2.5s | 436 MB | 4.9% err | NEEDS DEVICE TEST |
+| + ToMe r=0.1 (PyTorch) | 450ms | ~5.0s | -- | CD=0.71%, 1 fail | BEST PYTORCH |
+| ONNX FP32 (CPU) | 2745ms | ~6.2s | 1676 MB | CD=0.47%, 20/20 PASS | MEASURED |
+| **ONNX FP16 (CPU)** | 3064ms | **~3.1s** | **838 MB** | **CD=0.47%, 20/20 PASS** | **DEPLOY TARGET** |
+| ONNX INT8 (CPU) | 2522ms | ~1.6-2.5s | 436 MB | CD=0.56%, 3 marginal | BACKUP OPTION |

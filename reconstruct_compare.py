@@ -89,6 +89,57 @@ def time_inference(model: TSR, image_path: Path, device: str, n_runs: int = 5) -
     return float(np.mean(times))
 
 
+# --- ONNX inference ---
+
+def _preprocess_for_onnx(image_path: Path) -> np.ndarray:
+    """Preprocess image to (1, 3, 512, 512) float32 numpy array for ONNX."""
+    from tsr.utils import ImagePreprocessor
+    img = prepare_image(image_path)
+    processor = ImagePreprocessor()
+    rgb = processor(img, 512)  # (B, H, W, C)
+    return rgb.permute(0, 3, 1, 2).numpy()  # (B, C, H, W)
+
+
+def run_onnx_inference(
+    onnx_session,
+    model: TSR,
+    image_path: Path,
+    device: str,
+) -> trimesh.Trimesh:
+    """Run ONNX forward pass for scene_codes, then PyTorch mesh extraction."""
+    img_np = _preprocess_for_onnx(image_path)
+
+    input_meta = onnx_session.get_inputs()[0]
+    if input_meta.type == "tensor(float16)":
+        img_np = img_np.astype(np.float16)
+
+    scene_codes_np = onnx_session.run(None, {"image": img_np})[0]
+    scene_codes = torch.from_numpy(scene_codes_np.astype(np.float32)).to(device)
+
+    with torch.no_grad():
+        model.set_marching_cubes_resolution(256)
+        meshes = model.extract_mesh(scene_codes, has_vertex_color=True, resolution=256)
+    return meshes[0]
+
+
+def time_onnx_inference(onnx_session, image_path: Path, n_runs: int = 5) -> float:
+    """Return mean ONNX forward-pass latency in seconds."""
+    img_np = _preprocess_for_onnx(image_path)
+
+    input_meta = onnx_session.get_inputs()[0]
+    if input_meta.type == "tensor(float16)":
+        img_np = img_np.astype(np.float16)
+
+    times = []
+    for i in range(n_runs + 1):
+        t0 = time.perf_counter()
+        _ = onnx_session.run(None, {"image": img_np})
+        elapsed = time.perf_counter() - t0
+        if i > 0:
+            times.append(elapsed)
+    return float(np.mean(times))
+
+
 # --- Metrics ---
 
 def chamfer_distance(mesh_a: trimesh.Trimesh, mesh_b: trimesh.Trimesh, n_samples: int = 10000) -> float:
@@ -313,6 +364,50 @@ def run_variant(
 
 
 
+def run_onnx_variant(
+    onnx_path: Path,
+    model: TSR,
+    device: str,
+    variant_name: str,
+    test_images: list[Path],
+    measure_latency: bool = True,
+) -> list[dict]:
+    """Run an ONNX variant on all test images and compare to cached baseline."""
+    import onnxruntime as ort
+
+    print(f"  Loading ONNX: {onnx_path.name}")
+    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+
+    results = []
+    for img_path in test_images:
+        rel = str(img_path.relative_to(Path(__file__).parent / "test_images"))
+        print(f"  [{variant_name}] {rel} ...", end="", flush=True)
+
+        baseline_path = BASELINE_CACHE / f"{img_path.stem}.obj"
+        if not baseline_path.exists():
+            print(f" SKIP (no baseline cache)")
+            continue
+        baseline_mesh = trimesh.load(str(baseline_path), process=False)
+
+        variant_mesh = run_onnx_inference(session, model, img_path, device)
+        metrics = compute_metrics(baseline_mesh, variant_mesh)
+
+        latency = None
+        if measure_latency:
+            latency = time_onnx_inference(session, img_path, n_runs=3)
+
+        variant_dir = RESULTS_DIR / variant_name
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        variant_mesh.export(str(variant_dir / f"{img_path.stem}.obj"))
+
+        result = {"image": rel, "metrics": metrics, "latency": latency}
+        results.append(result)
+        status = status_for_metrics(metrics)
+        print(f" CD={metrics['cd_pct']:.3f}% F@1%={metrics['f_score_1pct']:.1f} IoU={metrics['volume_iou']:.1f} [{status}]")
+
+    return results
+
+
 def generate_baseline(model: TSR, device: str, test_images: list[Path]):
     """Generate and cache baseline meshes."""
     BASELINE_CACHE.mkdir(parents=True, exist_ok=True)
@@ -349,7 +444,7 @@ def main():
     parser.add_argument("--tome", nargs="+", type=float, help="Test ToMe at given merge ratios")
     parser.add_argument("--tome-layers", nargs="+", type=int, default=[4, 8, 12], help="ToMe merge layers")
     parser.add_argument("--image-prune", nargs="+", type=float, help="Test image token pruning at given ratios")
-    parser.add_argument("--onnx", type=Path, help="Test ONNX model variant")
+    parser.add_argument("--onnx", nargs="+", type=Path, help="Test ONNX model variant(s)")
     parser.add_argument("--all", action="store_true", help="Run all available variants")
     parser.add_argument("--device", default="auto", help="Device: auto, cpu, mps, cuda")
     parser.add_argument("--no-latency", action="store_true", help="Skip latency measurement")
@@ -397,22 +492,23 @@ def main():
                         "image_prune_ratio": ir,
                     })
 
+    onnx_variants = []
+
+    if args.onnx:
+        for onnx_path in args.onnx:
+            onnx_variants.append(onnx_path)
+
     if args.all:
         for ratio in [0.1, 0.2, 0.3]:
             variants_to_run.append({
                 "name": f"tome_r{ratio}_L4_8_12",
                 "tome_ratio": ratio, "tome_layers": [4, 8, 12],
             })
-        for ir in [0.25, 0.5]:
-            variants_to_run.append({
-                "name": f"imgprune_{ir}",
-                "image_prune_ratio": ir,
-            })
-        variants_to_run.append({
-            "name": "tome_r0.1_L4_8_12_imgprune_0.5",
-            "tome_ratio": 0.1, "tome_layers": [4, 8, 12],
-            "image_prune_ratio": 0.5,
-        })
+        models_dir = Path(__file__).parent / "models"
+        for onnx_name in ["triposr_fp32.onnx", "triposr_fp16.onnx", "triposr_int8.onnx"]:
+            p = models_dir / onnx_name
+            if p.exists():
+                onnx_variants.append(p)
 
     for variant in variants_to_run:
         name = variant.pop("name")
@@ -421,6 +517,18 @@ def main():
             model, device, name, test_images,
             measure_latency=not args.no_latency,
             **variant,
+        )
+        if results:
+            report = format_report(name, results)
+            print(f"\n{report}")
+            save_results(name, results, report)
+
+    for onnx_path in onnx_variants:
+        name = f"onnx_{onnx_path.stem}"
+        print(f"\n--- Variant: {name} ---")
+        results = run_onnx_variant(
+            onnx_path, model, device, name, test_images,
+            measure_latency=not args.no_latency,
         )
         if results:
             report = format_report(name, results)
