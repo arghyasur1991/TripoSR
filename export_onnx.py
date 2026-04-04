@@ -7,13 +7,19 @@ Also exports the NeRF decoder separately for on-device mesh extraction.
 
 All target ONNX opset 15 for Unity Sentis 2.5.0 compatibility.
 
+By default, exports with fully static shapes (batch=1, input [1,3,512,512]).
+This enables constant folding of the DINOv2 position-embedding bicubic Resize
+op, which Sentis 2.x silently downgrades to nearest (corrupting ViT quality).
+Use --dynamic to restore dynamic batch axis if needed for non-Sentis use.
+
 Graph optimization (opt_level=1) applies standard ONNX-compatible passes
 (constant folding, dead node elimination, CSE) without introducing ORT-specific
 fused operators. This keeps the graph clean for Unity Sentis import.
 
 Usage:
-    python export_onnx.py                       # FP32 + FP16 + INT8 (optimized)
+    python export_onnx.py                       # FP32 + FP16 + INT8 (static, optimized)
     python export_onnx.py --fp32-only           # FP32 only (optimized)
+    python export_onnx.py --dynamic             # Dynamic batch axis (non-Sentis)
     python export_onnx.py --no-optimize         # Skip graph optimization
     python export_onnx.py --benchmark           # export + benchmark
     python export_onnx.py --benchmark-only      # benchmark existing models
@@ -288,9 +294,15 @@ def get_dummy_image(device: str = "cpu") -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 def _export_wrapper_fp32(wrapper: nn.Module, output_path: Path, opset: int = 15,
-                         label: str = "FP32") -> torch.Tensor:
-    """Export an nn.Module wrapper (image -> scene_codes) to ONNX FP32."""
-    log(f"Exporting {label} to {output_path} (opset {opset})...")
+                         label: str = "FP32", static: bool = True) -> torch.Tensor:
+    """Export an nn.Module wrapper (image -> scene_codes) to ONNX FP32.
+
+    When static=True (default), all dimensions are fixed (batch=1). This lets
+    constant folding eliminate the DINOv2 position-embedding Resize op, which
+    Sentis 2.x silently downgrades from cubic to nearest (breaking quality).
+    """
+    mode_tag = "static" if static else "dynamic batch"
+    log(f"Exporting {label} to {output_path} (opset {opset}, {mode_tag})...")
     wrapper = wrapper.cpu()
     wrapper.eval()
 
@@ -303,21 +315,21 @@ def _export_wrapper_fp32(wrapper: nn.Module, output_path: Path, opset: int = 15,
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    t0 = time.time()
-    torch.onnx.export(
-        wrapper,
-        (dummy,),
-        str(output_path),
+    export_kwargs = dict(
         opset_version=opset,
         input_names=["image"],
         output_names=["scene_codes"],
-        dynamic_axes={
-            "image": {0: "batch"},
-            "scene_codes": {0: "batch"},
-        },
         do_constant_folding=True,
         dynamo=False,
     )
+    if not static:
+        export_kwargs["dynamic_axes"] = {
+            "image": {0: "batch"},
+            "scene_codes": {0: "batch"},
+        }
+
+    t0 = time.time()
+    torch.onnx.export(wrapper, (dummy,), str(output_path), **export_kwargs)
     log(f"  Export done in {time.time()-t0:.1f}s")
 
     fsize = output_path.stat().st_size / 1e6
@@ -325,19 +337,19 @@ def _export_wrapper_fp32(wrapper: nn.Module, output_path: Path, opset: int = 15,
     return ref_out
 
 
-def export_fp32(model: TSR, output_path: Path, opset: int = 15):
+def export_fp32(model: TSR, output_path: Path, opset: int = 15, static: bool = True):
     """Export the full forward pass (vanilla) to ONNX FP32."""
     wrapper = TripoSRForward(model)
-    return _export_wrapper_fp32(wrapper, output_path, opset, "FP32")
+    return _export_wrapper_fp32(wrapper, output_path, opset, "FP32", static=static)
 
 
 def export_tome_fp32(model: TSR, output_path: Path, opset: int = 15,
                      merge_ratio: float = 0.1,
-                     merge_layers: list | None = None):
+                     merge_layers: list | None = None, static: bool = True):
     """Export the forward pass with ToMe to ONNX FP32."""
     wrapper = TripoSRForwardToMe(model, merge_ratio, merge_layers)
     label = f"ToMe r={merge_ratio} FP32"
-    return _export_wrapper_fp32(wrapper, output_path, opset, label)
+    return _export_wrapper_fp32(wrapper, output_path, opset, label, static=static)
 
 
 def export_decoder(model: TSR, output_path: Path, opset: int = 15):
@@ -530,6 +542,8 @@ def benchmark_onnx(model_path: Path, n_runs: int = 10) -> float:
 def main():
     parser = argparse.ArgumentParser(description="Export TripoSR teacher to ONNX")
     parser.add_argument("--opset", type=int, default=15)
+    parser.add_argument("--dynamic", action="store_true",
+                        help="Use dynamic batch axis (default: fully static for Sentis compat)")
     parser.add_argument("--fp32-only", action="store_true", help="Skip FP16 and INT8")
     parser.add_argument("--no-optimize", action="store_true",
                         help="Skip ORT opt_level=1 graph optimization")
@@ -579,7 +593,7 @@ def main():
             log("MAIN MODEL: TripoSR Forward Pass (Vanilla)")
             log("=" * 60)
 
-            ref_out = export_fp32(teacher, fp32_path, args.opset)
+            ref_out = export_fp32(teacher, fp32_path, args.opset, static=not args.dynamic)
             ref_np = ref_out.numpy()
 
             if not args.no_optimize:
@@ -617,6 +631,7 @@ def main():
             tome_fp32_ref = export_tome_fp32(
                 teacher, tome_fp32_path, args.opset,
                 merge_ratio=tome_ratio, merge_layers=args.tome_layers,
+                static=not args.dynamic,
             )
 
             if not args.no_optimize:
