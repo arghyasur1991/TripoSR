@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -64,6 +65,190 @@ class TripoSRForward(nn.Module):
         return scene_codes
 
 
+class TripoSRForwardToMe(nn.Module):
+    """Wrapper with inline Token Merging: image (B,3,512,512) -> scene_codes (B,3,40,64,64).
+
+    Bakes the ToMe merge/unmerge ops directly into the traced forward graph,
+    avoiding Python-level mutable state that can't survive ONNX tracing.
+    Merge decisions are data-dependent (computed at runtime from token similarity).
+    """
+
+    TOKENS_PER_PLANE = 1024
+    NUM_PLANES = 3
+
+    def __init__(self, model: TSR, merge_ratio: float = 0.1,
+                 merge_layers: list | None = None):
+        super().__init__()
+        self.image_tokenizer = model.image_tokenizer
+        self.tokenizer = model.tokenizer
+        self.post_processor = model.post_processor
+        # Store backbone sub-modules directly so tracer sees them
+        self.bb_norm = model.backbone.norm
+        self.bb_proj_in = model.backbone.proj_in
+        self.bb_proj_out = model.backbone.proj_out
+        self.bb_blocks = model.backbone.transformer_blocks
+
+        self.merge_ratio = merge_ratio
+        _layers = merge_layers or [4, 8, 12]
+        self.merge_layer_set = set(_layers)
+
+    @staticmethod
+    def _bipartite_soft_matching(metric: torch.Tensor, r: int):
+        """Bipartite soft matching — returns (kept_idx, src_idx, dst_merge_target)."""
+        B, N, C = metric.shape
+        metric = F.normalize(metric, dim=-1)
+
+        a_idx = torch.arange(0, N, 2, device=metric.device)
+        b_idx = torch.arange(1, N, 2, device=metric.device)
+
+        scores = torch.bmm(metric[:, a_idx], metric[:, b_idx].transpose(1, 2))
+        node_max, node_idx = scores.max(dim=-1)
+        _, sorted_indices = node_max.sort(dim=-1, descending=True)
+
+        merge_src_local = sorted_indices[:, :r]
+        keep_src_local = sorted_indices[:, r:]
+
+        src_idx = a_idx[merge_src_local]
+        dst_local = torch.gather(node_idx, 1, merge_src_local)
+        dst_merge_target = b_idx[dst_local]
+
+        keep_a = a_idx[keep_src_local]
+        keep_b = b_idx.unsqueeze(0).expand(B, -1)
+        kept_idx = torch.cat([keep_a, keep_b], dim=1)
+        kept_idx, _ = kept_idx.sort(dim=1)
+
+        return kept_idx, src_idx, dst_merge_target
+
+    @staticmethod
+    def _find_positions(kept_idx: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """ONNX-friendly replacement for torch.searchsorted.
+
+        For each target value, finds its index in the sorted kept_idx tensor
+        via broadcast comparison + argmax.
+        """
+        # kept_idx: (B, K), targets: (B, r)
+        match = (kept_idx.unsqueeze(-1) == targets.unsqueeze(1))  # (B, K, r)
+        return match.to(torch.int64).argmax(dim=1)  # (B, r)
+
+    @staticmethod
+    def _merge_tokens(x: torch.Tensor, kept_idx: torch.Tensor,
+                      src_idx: torch.Tensor, dst_merge_target: torch.Tensor):
+        B, N, C = x.shape
+        merged = torch.gather(x, 1, kept_idx.unsqueeze(-1).expand(-1, -1, C))
+        src_tokens = torch.gather(x, 1, src_idx.unsqueeze(-1).expand(-1, -1, C))
+        dst_positions = TripoSRForwardToMe._find_positions(kept_idx, dst_merge_target)
+        dst_positions = dst_positions.clamp(0, kept_idx.shape[1] - 1)
+        merged.scatter_add_(1, dst_positions.unsqueeze(-1).expand(-1, -1, C), src_tokens)
+        counts = torch.ones(B, merged.shape[1], 1, device=x.device, dtype=x.dtype)
+        ones_r = torch.ones(B, src_idx.shape[1], 1, device=x.device, dtype=x.dtype)
+        counts.scatter_add_(1, dst_positions.unsqueeze(-1), ones_r)
+        return merged / counts
+
+    @staticmethod
+    def _unmerge_tokens(merged: torch.Tensor, kept_idx: torch.Tensor,
+                        src_idx: torch.Tensor, dst_merge_target: torch.Tensor,
+                        original_n: int):
+        B, _, C = merged.shape
+        output = torch.zeros(B, original_n, C, device=merged.device, dtype=merged.dtype)
+        output.scatter_(1, kept_idx.unsqueeze(-1).expand(-1, -1, C), merged)
+        dst_values = torch.gather(output, 1, dst_merge_target.unsqueeze(-1).expand(-1, -1, C))
+        output.scatter_(1, src_idx.unsqueeze(-1).expand(-1, -1, C), dst_values)
+        return output
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        batch_size = image.shape[0]
+
+        input_image_tokens = self.image_tokenizer(image.unsqueeze(1))
+        input_image_tokens = rearrange(
+            input_image_tokens, "B Nv C Nt -> B (Nv Nt) C", Nv=1
+        )
+
+        tokens = self.tokenizer(batch_size)
+
+        # --- Inline backbone forward with ToMe ---
+        hidden_states = tokens
+        batch, _, seq_len = hidden_states.shape
+        residual_full = hidden_states
+
+        hidden_states = self.bb_norm(hidden_states)
+        inner_dim = hidden_states.shape[1]
+        hidden_states = hidden_states.permute(0, 2, 1).reshape(batch, seq_len, inner_dim)
+        hidden_states = self.bb_proj_in(hidden_states)
+
+        # merge_info: list of per-layer lists of (kept_idx, src_idx, dst, orig_n) per plane
+        all_merge_info = []
+        current_n = [self.TOKENS_PER_PLANE] * self.NUM_PLANES
+
+        for layer_idx in range(len(self.bb_blocks)):
+            if layer_idx in self.merge_layer_set:
+                # Within-plane merge
+                planes = []
+                layer_info = []
+                offset = 0
+                new_n = list(current_n)
+                for p in range(self.NUM_PLANES):
+                    n_p = current_n[p]
+                    plane_tokens = hidden_states[:, offset:offset + n_p, :]
+                    r = int(n_p * self.merge_ratio)
+                    if r > 0 and n_p > 2 * r:
+                        ki, si, dm = self._bipartite_soft_matching(plane_tokens, r)
+                        merged_plane = self._merge_tokens(plane_tokens, ki, si, dm)
+                        planes.append(merged_plane)
+                        layer_info.append((ki, si, dm, n_p))
+                        new_n[p] = n_p - r
+                    else:
+                        planes.append(plane_tokens)
+                        layer_info.append(None)
+                    offset += n_p
+                hidden_states = torch.cat(planes, dim=1)
+                all_merge_info.append(layer_info)
+                current_n = new_n
+
+            hidden_states = self.bb_blocks[layer_idx](
+                hidden_states,
+                encoder_hidden_states=input_image_tokens,
+            )
+
+        # Unmerge all layers in reverse
+        for layer_info in reversed(all_merge_info):
+            B_um, N_um, C_um = hidden_states.shape
+            planes = []
+            offset = 0
+            plane_sizes = []
+            remaining = N_um
+            for p in range(self.NUM_PLANES):
+                if layer_info[p] is not None:
+                    _, _, _, orig_n = layer_info[p]
+                    r = layer_info[p][1].shape[1]
+                    plane_sizes.append(orig_n - r)
+                    remaining -= (orig_n - r)
+                else:
+                    sz = remaining // (self.NUM_PLANES - p)
+                    plane_sizes.append(sz)
+                    remaining -= sz
+            for p in range(self.NUM_PLANES):
+                n_p = plane_sizes[p]
+                plane_tokens = hidden_states[:, offset:offset + n_p, :]
+                if layer_info[p] is not None:
+                    ki, si, dm, orig_n = layer_info[p]
+                    plane_tokens = self._unmerge_tokens(plane_tokens, ki, si, dm, orig_n)
+                planes.append(plane_tokens)
+                offset += n_p
+            hidden_states = torch.cat(planes, dim=1)
+
+        hidden_states = self.bb_proj_out(hidden_states)
+        hidden_states = (
+            hidden_states.reshape(batch, seq_len, inner_dim)
+            .permute(0, 2, 1)
+            .contiguous()
+        )
+        output = hidden_states + residual_full
+        # --- End inline backbone ---
+
+        scene_codes = self.post_processor(self.tokenizer.detokenize(output))
+        return scene_codes
+
+
 class DecoderWrapper(nn.Module):
     """Wrapper for NeRF MLP decoder: triplane features (N, 120) -> density+color (N, 4)."""
 
@@ -96,10 +281,11 @@ def get_dummy_image(device: str = "cpu") -> torch.Tensor:
 # FP32 export
 # ---------------------------------------------------------------------------
 
-def export_fp32(model: TSR, output_path: Path, opset: int = 15):
-    """Export the full forward pass to ONNX FP32."""
-    log(f"Exporting FP32 to {output_path} (opset {opset})...")
-    wrapper = TripoSRForward(model).cpu()
+def _export_wrapper_fp32(wrapper: nn.Module, output_path: Path, opset: int = 15,
+                         label: str = "FP32") -> torch.Tensor:
+    """Export an nn.Module wrapper (image -> scene_codes) to ONNX FP32."""
+    log(f"Exporting {label} to {output_path} (opset {opset})...")
+    wrapper = wrapper.cpu()
     wrapper.eval()
 
     dummy = get_dummy_image("cpu")
@@ -129,8 +315,23 @@ def export_fp32(model: TSR, output_path: Path, opset: int = 15):
     log(f"  Export done in {time.time()-t0:.1f}s")
 
     fsize = output_path.stat().st_size / 1e6
-    log(f"  FP32 ONNX: {fsize:.1f}MB")
+    log(f"  {label} ONNX: {fsize:.1f}MB")
     return ref_out
+
+
+def export_fp32(model: TSR, output_path: Path, opset: int = 15):
+    """Export the full forward pass (vanilla) to ONNX FP32."""
+    wrapper = TripoSRForward(model)
+    return _export_wrapper_fp32(wrapper, output_path, opset, "FP32")
+
+
+def export_tome_fp32(model: TSR, output_path: Path, opset: int = 15,
+                     merge_ratio: float = 0.1,
+                     merge_layers: list | None = None):
+    """Export the forward pass with ToMe to ONNX FP32."""
+    wrapper = TripoSRForwardToMe(model, merge_ratio, merge_layers)
+    label = f"ToMe r={merge_ratio} FP32"
+    return _export_wrapper_fp32(wrapper, output_path, opset, label)
 
 
 def export_decoder(model: TSR, output_path: Path, opset: int = 15):
@@ -301,6 +502,12 @@ def main():
     parser.add_argument("--skip-verify", action="store_true")
     parser.add_argument("--benchmark", action="store_true", help="Benchmark after export")
     parser.add_argument("--benchmark-only", action="store_true", help="Only benchmark existing")
+    parser.add_argument("--tome", type=float, default=None,
+                        help="Export ToMe variant with given merge ratio (e.g. 0.1)")
+    parser.add_argument("--tome-layers", nargs="+", type=int, default=[4, 8, 12],
+                        help="ToMe merge layers (default: 4 8 12)")
+    parser.add_argument("--tome-only", action="store_true",
+                        help="Only export ToMe variant (skip vanilla)")
     parser.add_argument("--runs", type=int, default=10, help="Benchmark runs")
     parser.add_argument("--output-dir", type=Path, default=MODELS_DIR)
     args = parser.parse_args()
@@ -313,34 +520,82 @@ def main():
     int8_path = out_dir / "triposr_int8.onnx"
     dec_fp32_path = out_dir / "nerf_decoder.onnx"
 
+    # ToMe variant paths
+    tome_ratio = args.tome
+    tome_tag = f"_tome{tome_ratio}" if tome_ratio else ""
+    tome_fp32_path = out_dir / f"triposr_tome_fp32.onnx"
+    tome_fp16_path = out_dir / f"triposr_tome_fp16.onnx"
+    tome_int8_path = out_dir / f"triposr_tome_int8.onnx"
+
     if not args.benchmark_only:
         log("Loading teacher model...")
         teacher = load_teacher("cpu")
-
-        # --- Main model ---
-        log("\n" + "=" * 60)
-        log("MAIN MODEL: TripoSR Forward Pass")
-        log("=" * 60)
-
-        ref_out = export_fp32(teacher, fp32_path, args.opset)
-        ref_np = ref_out.numpy()
         img_np = get_dummy_image("cpu").numpy()
-
         results = []
-        if not args.skip_verify:
-            results.append(verify_onnx(fp32_path, img_np, ref_np, "image", "FP32"))
 
-        if not args.fp32_only:
-            convert_fp16(fp32_path, fp16_path)
-            if not args.skip_verify:
-                results.append(verify_onnx(fp16_path, img_np, ref_np, "image", "FP16"))
+        # --- Vanilla Main model ---
+        if not args.tome_only:
+            log("\n" + "=" * 60)
+            log("MAIN MODEL: TripoSR Forward Pass (Vanilla)")
+            log("=" * 60)
 
-            quantize_int8(fp32_path, int8_path)
+            ref_out = export_fp32(teacher, fp32_path, args.opset)
+            ref_np = ref_out.numpy()
+
             if not args.skip_verify:
-                results.append(verify_onnx(int8_path, img_np, ref_np, "image", "INT8"))
+                results.append(verify_onnx(fp32_path, img_np, ref_np, "image", "FP32"))
+
+            if not args.fp32_only:
+                convert_fp16(fp32_path, fp16_path)
+                if not args.skip_verify:
+                    results.append(verify_onnx(fp16_path, img_np, ref_np, "image", "FP16"))
+
+                quantize_int8(fp32_path, int8_path)
+                if not args.skip_verify:
+                    results.append(verify_onnx(int8_path, img_np, ref_np, "image", "INT8"))
+
+        # --- ToMe variant ---
+        if tome_ratio is not None:
+            log("\n" + "=" * 60)
+            log(f"TOME MODEL: ToMe r={tome_ratio}, layers={args.tome_layers}")
+            log("=" * 60)
+
+            # Get PyTorch ToMe reference for accuracy comparison
+            tome_wrapper = TripoSRForwardToMe(
+                teacher, merge_ratio=tome_ratio, merge_layers=args.tome_layers
+            ).cpu()
+            tome_wrapper.eval()
+            with torch.no_grad():
+                tome_ref = tome_wrapper(get_dummy_image("cpu"))
+            tome_ref_np = tome_ref.numpy()
+            log(f"  PyTorch ToMe ref: shape={tome_ref.shape}, "
+                f"range=[{tome_ref.min():.2f}, {tome_ref.max():.2f}]")
+
+            tome_fp32_ref = export_tome_fp32(
+                teacher, tome_fp32_path, args.opset,
+                merge_ratio=tome_ratio, merge_layers=args.tome_layers,
+            )
+
+            if not args.skip_verify:
+                results.append(verify_onnx(
+                    tome_fp32_path, img_np, tome_ref_np,
+                    "image", f"ToMe r={tome_ratio} FP32"))
+
+            if not args.fp32_only:
+                convert_fp16(tome_fp32_path, tome_fp16_path)
+                if not args.skip_verify:
+                    results.append(verify_onnx(
+                        tome_fp16_path, img_np, tome_ref_np,
+                        "image", f"ToMe r={tome_ratio} FP16"))
+
+                quantize_int8(tome_fp32_path, tome_int8_path)
+                if not args.skip_verify:
+                    results.append(verify_onnx(
+                        tome_int8_path, img_np, tome_ref_np,
+                        "image", f"ToMe r={tome_ratio} INT8"))
 
         # --- NeRF Decoder ---
-        if not args.skip_decoder:
+        if not args.skip_decoder and not args.tome_only:
             log("\n" + "=" * 60)
             log("NERF DECODER")
             log("=" * 60)
@@ -355,10 +610,10 @@ def main():
             log("\n" + "=" * 60)
             log("ACCURACY & SIZE SUMMARY")
             log("=" * 60)
-            log(f"{'Variant':<20} {'Size':>8} {'Max Err%':>10} {'Mean Err%':>10}")
-            log("-" * 50)
+            log(f"{'Variant':<30} {'Size':>8} {'Max Err%':>10} {'Mean Err%':>10}")
+            log("-" * 60)
             for r in results:
-                log(f"{r['label']:<20} {r['size_mb']:>7.1f}MB "
+                log(f"{r['label']:<30} {r['size_mb']:>7.1f}MB "
                     f"{r['max_rel']*100:>9.4f}% {r['mean_rel']*100:>9.4f}%")
 
     if args.benchmark or args.benchmark_only:
@@ -366,15 +621,18 @@ def main():
         log(f"BENCHMARKING ({args.runs} runs, first is warmup)")
         log("=" * 60)
         bench_results = {}
-        for path in [fp32_path, fp16_path, int8_path]:
+        all_paths = [fp32_path, fp16_path, int8_path,
+                     tome_fp32_path, tome_fp16_path, tome_int8_path]
+        for path in all_paths:
             if path.exists():
                 bench_results[path.stem] = benchmark_onnx(path, args.runs)
 
         if bench_results:
             log("\n--- Speed Summary ---")
-            base = bench_results.get("triposr_fp32", 1.0)
+            base = bench_results.get("triposr_fp32",
+                   bench_results.get("triposr_tome_fp32", 1.0))
             for name, t in bench_results.items():
-                log(f"  {name}: {t:.3f}s ({base/t:.2f}x vs FP32)")
+                log(f"  {name}: {t:.3f}s ({base/t:.2f}x vs base)")
 
     log("\nDone!")
 

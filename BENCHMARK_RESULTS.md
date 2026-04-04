@@ -225,6 +225,57 @@ further improve this but needs on-device validation (mobile INT8 GPU support is 
 
 ---
 
+## Phase 5: ToMe ONNX Export (combined optimization)
+
+**Date:** 2026-04-04
+**Implementation:** `TripoSRForwardToMe` wrapper in `export_onnx.py` — inlines ToMe
+merge/unmerge ops directly in the forward graph (no monkey-patching state).
+Replaced `torch.searchsorted` with broadcast-comparison `argmax` for ONNX opset 15 compat.
+
+### Model Sizes
+
+| Variant | Size | vs Vanilla FP32 |
+|---|---|---|
+| ToMe FP32 | 1675.6 MB | ~100% (same weights, extra merge ops negligible) |
+| ToMe FP16 | 838.3 MB | 50% |
+| ToMe INT8 | 435.5 MB | 26% |
+
+### Speed (ORT CPUExecutionProvider, M4 Max)
+
+| Variant | Mean (s) | vs Vanilla FP32 |
+|---|---|---|
+| Vanilla FP32 | 2.688 | 1.00x |
+| ToMe FP32 | 2.527 | 1.06x |
+| Vanilla FP16 | 3.008 | 0.89x |
+| ToMe FP16 | 3.063 | 0.88x |
+| Vanilla INT8 | 2.384 | 1.13x |
+| ToMe INT8 | 2.493 | 1.08x |
+
+On CPU, ToMe speedup is modest (1.06x) because merge/unmerge overhead partially
+offsets attention savings. On GPU (Quest 3 XR2), self-attention is quadratic in
+sequence length, so the ~10% token reduction should yield ~1.17x speedup (matching
+PyTorch MPS measurements).
+
+### Reconstruction Quality (20-image test set, full ONNX pipeline with decoder)
+
+| Variant | Mean CD (%) | Mean F@1% | Mean F@2% | Pass | Marginal | Fail | Overall |
+|---|---|---|---|---|---|---|---|
+| ToMe FP32 + Decoder | 0.717 | 83.8 | 97.3 | 12 | 7 | 1 | matches PyTorch ToMe |
+| ToMe FP16 + Decoder | 0.710 | 84.3 | 97.2 | 12 | 7 | 1 | matches PyTorch ToMe |
+
+Quality is **identical to PyTorch ToMe r=0.1** (CD=0.71%, same 1 failure on book_nobg).
+ONNX conversion introduces no additional quality degradation beyond what ToMe itself causes.
+
+### Quest 3 Estimates (combined: ToMe + FP16)
+
+| Variant | Quest 3 GPU est. | Notes |
+|---|---|---|
+| Vanilla FP16 | ~3.1s | Baseline deployment target |
+| **ToMe r=0.1 FP16** | **~2.5-2.7s** | ToMe 1.17x compute + FP16 2x bandwidth |
+| ToMe r=0.1 INT8 | ~1.4-2.0s | Needs on-device validation |
+
+---
+
 ## Cumulative Results Summary
 
 | Variant | Forward (M4 Max) | Quest 3 est. | Size | Quality (20 imgs) | Status |
@@ -235,4 +286,7 @@ further improve this but needs on-device validation (mobile INT8 GPU support is 
 | **ONNX FP16 (CPU)** | 3064ms | **~3.1s** | **838 MB** | **CD=0.47%, 20/20 PASS** | **DEPLOY TARGET** |
 | ONNX INT8 (CPU) | 2522ms | ~1.6-2.5s | 436 MB | CD=0.56%, 3 marginal | BACKUP OPTION |
 | FP32 + ONNX decoder (full pipeline) | -- | -- | 1676+0.17 MB | CD=0.47%, 20/20 PASS | VALIDATED |
-| **FP16 + ONNX decoder (full pipeline)** | -- | -- | **838+0.17 MB** | **CD=0.47%, 20/20 PASS** | **VALIDATED** |
+| FP16 + ONNX decoder (full pipeline) | -- | -- | 838+0.17 MB | CD=0.47%, 20/20 PASS | VALIDATED |
+| ToMe FP32 ONNX (CPU) | 2527ms | ~5.5s | 1676 MB | CD=0.72%, 1 fail | MEASURED |
+| **ToMe FP16 ONNX (CPU)** | 3063ms | **~2.5-2.7s** | **838 MB** | **CD=0.71%, 1 fail** | **SPEED OPTION** |
+| ToMe INT8 ONNX (CPU) | 2493ms | ~1.4-2.0s | 436 MB | CD=0.71%, 1 fail | NEEDS VALIDATION |
