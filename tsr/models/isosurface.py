@@ -44,8 +44,7 @@ class MarchingCubeHelper(IsosurfaceHelper):
         level = -level.view(self.resolution, self.resolution, self.resolution)
         try:
             v_pos, t_pos_idx = self.mc_func(level.detach(), 0.0)
-        except AttributeError:
-            print("torchmcubes was not compiled with CUDA support, use CPU version instead.")
+        except (AttributeError, RuntimeError):
             v_pos, t_pos_idx = self.mc_func(level.detach().cpu(), 0.0)
         v_pos = v_pos[..., [2, 1, 0]]
         v_pos = v_pos / (self.resolution - 1.0)
