@@ -258,12 +258,15 @@ def run_variant(
     measure_latency: bool = True,
     tome_ratio: Optional[float] = None,
     tome_layers: Optional[list[int]] = None,
+    image_prune_ratio: Optional[float] = None,
 ) -> list[dict]:
     """Run a variant on all test images and compute metrics vs cached baseline."""
-    from tome_patch import apply_tome
+    from tome_patch import apply_tome, apply_image_tome
 
     if tome_ratio is not None:
         apply_tome(model.backbone, merge_ratio=tome_ratio, merge_layers=tome_layers or [4, 8, 12])
+    if image_prune_ratio is not None:
+        apply_image_tome(model, prune_ratio=image_prune_ratio)
 
     results = []
     for img_path in test_images:
@@ -298,23 +301,16 @@ def run_variant(
         status = status_for_metrics(metrics)
         print(f" CD={metrics['cd_pct']:.3f}% F@1%={metrics['f_score_1pct']:.1f} IoU={metrics['volume_iou']:.1f} [{status}]")
 
-    # restore original forward if ToMe was applied
+    # restore original forwards
+    if image_prune_ratio is not None:
+        from tome_patch import remove_image_tome
+        remove_image_tome(model)
     if tome_ratio is not None:
-        from tsr.models.transformer.transformer_1d import Transformer1D
-        model.backbone.forward = TripoSR_forward_restore(model.backbone)
+        from tome_patch import remove_tome
+        remove_tome(model.backbone)
 
     return results
 
-
-def TripoSR_forward_restore(backbone):
-    """Restore original Transformer1D forward method."""
-    from tsr.models.transformer.transformer_1d import Transformer1D
-    if hasattr(backbone, '_tome_original_forward'):
-        del backbone._tome_state
-        del backbone._tome_merge_ratio
-        del backbone._tome_merge_layers
-        del backbone._tome_original_forward
-    return Transformer1D.forward.__get__(backbone)
 
 
 def generate_baseline(model: TSR, device: str, test_images: list[Path]):
@@ -352,6 +348,7 @@ def main():
     parser.add_argument("--baseline", action="store_true", help="Generate/cache baseline meshes")
     parser.add_argument("--tome", nargs="+", type=float, help="Test ToMe at given merge ratios")
     parser.add_argument("--tome-layers", nargs="+", type=int, default=[4, 8, 12], help="ToMe merge layers")
+    parser.add_argument("--image-prune", nargs="+", type=float, help="Test image token pruning at given ratios")
     parser.add_argument("--onnx", type=Path, help="Test ONNX model variant")
     parser.add_argument("--all", action="store_true", help="Run all available variants")
     parser.add_argument("--device", default="auto", help="Device: auto, cpu, mps, cuda")
@@ -380,19 +377,50 @@ def main():
 
     if args.tome:
         for ratio in args.tome:
-            variants_to_run.append(("tome", ratio, args.tome_layers))
+            variants_to_run.append({
+                "name": f"tome_r{ratio}_L{'_'.join(map(str, args.tome_layers))}",
+                "tome_ratio": ratio, "tome_layers": args.tome_layers,
+            })
+
+    if args.image_prune:
+        for ratio in args.image_prune:
+            variants_to_run.append({
+                "name": f"imgprune_{ratio}",
+                "image_prune_ratio": ratio,
+            })
+        if args.tome:
+            for tr in args.tome:
+                for ir in args.image_prune:
+                    variants_to_run.append({
+                        "name": f"tome_r{tr}_L{'_'.join(map(str, args.tome_layers))}_imgprune_{ir}",
+                        "tome_ratio": tr, "tome_layers": args.tome_layers,
+                        "image_prune_ratio": ir,
+                    })
 
     if args.all:
         for ratio in [0.1, 0.2, 0.3]:
-            variants_to_run.append(("tome", ratio, [4, 8, 12]))
+            variants_to_run.append({
+                "name": f"tome_r{ratio}_L4_8_12",
+                "tome_ratio": ratio, "tome_layers": [4, 8, 12],
+            })
+        for ir in [0.25, 0.5]:
+            variants_to_run.append({
+                "name": f"imgprune_{ir}",
+                "image_prune_ratio": ir,
+            })
+        variants_to_run.append({
+            "name": "tome_r0.1_L4_8_12_imgprune_0.5",
+            "tome_ratio": 0.1, "tome_layers": [4, 8, 12],
+            "image_prune_ratio": 0.5,
+        })
 
-    for vtype, ratio, layers in variants_to_run:
-        name = f"tome_r{ratio}_L{'_'.join(map(str, layers))}"
+    for variant in variants_to_run:
+        name = variant.pop("name")
         print(f"\n--- Variant: {name} ---")
         results = run_variant(
             model, device, name, test_images,
             measure_latency=not args.no_latency,
-            tome_ratio=ratio, tome_layers=layers,
+            **variant,
         )
         if results:
             report = format_report(name, results)

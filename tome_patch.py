@@ -1,17 +1,24 @@
-"""Token Merging (ToMe) for TripoSR's Transformer1D backbone.
+"""Token Merging (ToMe) for TripoSR.
 
-Merges similar triplane tokens between transformer layers to reduce
-self-attention cost. Merging is within-plane only (3 planes of 32x32 = 1024
-tokens each) to avoid blending XY/XZ/YZ semantics.
+Two independent optimizations that can be stacked:
+
+1. **Triplane Token Merging** -- merges similar triplane tokens between
+   transformer layers to reduce self-attention cost. Within-plane only.
+   Applied by monkey-patching Transformer1D.forward().
+
+2. **Image Token Pruning** -- merges similar DINOv2 patch tokens to reduce
+   cross-attention cost in every backbone layer.
+   Applied by monkey-patching TSR.forward().
 
 Usage:
-    from tome_patch import apply_tome, remove_tome
+    from tome_patch import apply_tome, apply_image_tome, remove_tome, remove_image_tome
 
     model = TSR.from_pretrained(...)
-    apply_tome(model.backbone, merge_ratio=0.2, merge_layers=[4, 8, 12])
-    # ... run inference as normal ...
-    # scene_codes = model(image, device)   # internally merges+unmerges
-    remove_tome(model.backbone)            # restore original behavior
+    apply_tome(model.backbone, merge_ratio=0.1, merge_layers=[4, 8, 12])
+    apply_image_tome(model, prune_ratio=0.5)
+    scene_codes = model(image, device)
+    remove_image_tome(model)
+    remove_tome(model.backbone)
 """
 
 import math
@@ -43,7 +50,7 @@ def bipartite_soft_matching(
         merge_map: (B, r) for each source, which destination it merges into (index into dst set)
     """
     B, N, C = metric.shape
-    if r <= 0 or r >= N // 2:
+    if r <= 0 or r > N // 2:
         return None, None, None
 
     with torch.no_grad():
@@ -322,8 +329,96 @@ def _unmerge_all(
 def remove_tome(backbone):
     """Remove ToMe patching and restore original forward."""
     if hasattr(backbone, '_tome_original_forward'):
-        backbone.forward = lambda *args, **kwargs: backbone._tome_original_forward(backbone, *args, **kwargs)
+        # Delete the instance-level override so class method is used again
+        if 'forward' in backbone.__dict__:
+            del backbone.__dict__['forward']
         del backbone._tome_original_forward
         del backbone._tome_state
         del backbone._tome_merge_ratio
         del backbone._tome_merge_layers
+
+
+# --- Image Token Pruning ---
+
+
+def prune_image_tokens(
+    image_tokens: torch.Tensor,
+    prune_ratio: float = 0.5,
+) -> torch.Tensor:
+    """Merge similar DINOv2 patch tokens to reduce cross-attention cost.
+
+    Keeps the CLS token (index 0) and merges the remaining 1024 patch tokens.
+
+    Args:
+        image_tokens: (B, 1025, C) -- CLS + 1024 patch tokens from DINOv2
+        prune_ratio: fraction of patch tokens to remove (0.5 = 1025 -> 513)
+
+    Returns:
+        pruned: (B, 1 + N_kept, C) with CLS prepended
+    """
+    B, N, C = image_tokens.shape
+    cls_token = image_tokens[:, :1, :]
+    patch_tokens = image_tokens[:, 1:, :]
+
+    n_patches = patch_tokens.shape[1]
+    r = int(n_patches * prune_ratio)
+
+    if r <= 0 or r > n_patches // 2:
+        return image_tokens
+
+    kept_idx, src_idx, dst_merge_target = bipartite_soft_matching(patch_tokens, r)
+
+    if kept_idx is None:
+        return image_tokens
+
+    merged_patches = merge_tokens(patch_tokens, kept_idx, src_idx, dst_merge_target)
+    return torch.cat([cls_token, merged_patches], dim=1)
+
+
+def apply_image_tome(model, prune_ratio: float = 0.5):
+    """Monkey-patch TSR.forward() to prune image tokens after DINOv2.
+
+    Args:
+        model: TSR model instance
+        prune_ratio: fraction of patch tokens to merge (0.5 = 1025 -> 513)
+    """
+    from einops import rearrange
+
+    model._image_tome_prune_ratio = prune_ratio
+    original_forward = model.__class__.forward
+
+    def pruned_forward(self, image, device):
+        import PIL.Image
+        rgb_cond = self.image_processor(image, self.cfg.cond_image_size)[:, None].to(device)
+        batch_size = rgb_cond.shape[0]
+
+        input_image_tokens = self.image_tokenizer(
+            rearrange(rgb_cond, "B Nv H W C -> B Nv C H W", Nv=1),
+        )
+        input_image_tokens = rearrange(
+            input_image_tokens, "B Nv C Nt -> B (Nv Nt) C", Nv=1
+        )
+
+        input_image_tokens = prune_image_tokens(
+            input_image_tokens, self._image_tome_prune_ratio
+        )
+
+        tokens = self.tokenizer(batch_size)
+        tokens = self.backbone(
+            tokens,
+            encoder_hidden_states=input_image_tokens,
+        )
+        scene_codes = self.post_processor(self.tokenizer.detokenize(tokens))
+        return scene_codes
+
+    model.forward = lambda *args, **kwargs: pruned_forward(model, *args, **kwargs)
+    model._image_tome_original_forward = original_forward
+
+
+def remove_image_tome(model):
+    """Restore original TSR.forward()."""
+    if hasattr(model, '_image_tome_original_forward'):
+        if 'forward' in model.__dict__:
+            del model.__dict__['forward']
+        del model._image_tome_original_forward
+        del model._image_tome_prune_ratio

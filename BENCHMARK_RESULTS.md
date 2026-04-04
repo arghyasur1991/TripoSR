@@ -116,9 +116,35 @@ cubes meshes aren't watertight, making voxel containment unreliable.
 
 ---
 
-## Phase 3: Image Token Pruning
+## Phase 3: Image Token Pruning (DINOv2 output)
 
-*(To be filled)*
+**Date:** 2026-04-04
+**Implementation:** `prune_image_tokens()` in `tome_patch.py` -- bipartite soft matching on 1024 DINOv2 patch tokens (CLS preserved)
+
+### Speed Results
+
+| Variant | Mean (s) | Speedup |
+|---|---|---|
+| Baseline | 0.525 | 1.00x |
+| Image prune 0.25 only | 0.511 | 1.03x |
+| Image prune 0.5 only | 0.486 | 1.08x |
+| ToMe r=0.1 + Img prune 0.5 | 0.448 | 1.17x |
+| ToMe r=0.1 + Img prune 0.25 | 0.482 | 1.09x |
+
+### Quality Results (20-image test set)
+
+| Variant | Mean CD (%) | Mean F@1% | Mean F@2% | Failures | Assessment |
+|---|---|---|---|---|---|
+| ToMe r=0.1 alone | 0.71 | 84.3 | 97.3 | 1/20 | Good baseline |
+| Image prune 0.5 alone | 0.90 | 76.3 | 93.9 | 3/20 | Worse than ToMe |
+| ToMe r=0.1 + Img 0.5 | 0.95 | 70.7 | 92.0 | 3/20 | No speed gain, quality regression |
+
+### Conclusion
+
+**Image token pruning is NOT worth it.** DINOv2 patch tokens carry critical visual detail for
+cross-attention. At 50% pruning: only 1.08x speedup, but 3 failures and worse quality than
+ToMe r=0.1 alone. Stacking with ToMe gives no additional speedup (matching overhead offsets
+cross-attention savings). **Dropped from the optimization stack.**
 
 ---
 
@@ -133,8 +159,9 @@ cubes meshes aren't watertight, making voxel containment unreliable.
 | Variant | Forward (M4 Max) | Quest 3 est. | CD (%) | F@1% | F@2% | Status |
 |---|---|---|---|---|---|---|
 | Baseline (PyTorch) | 560ms | ~6.2s | 0 (ref) | 100 (ref) | 100 (ref) | MEASURED |
-| + ToMe r=0.1 | 450ms | ~5.0s | 0.71 | 84.2 | 97.3 | MEASURED |
-| + ToMe r=0.2 | 375ms | ~4.1s | 1.04 | 63.1 | 90.5 | MEASURED |
-| + Image token pruning | TBD | TBD | TBD | TBD | TBD | PENDING |
-| + FP16 quantization | TBD | TBD | TBD | TBD | TBD | PENDING |
-| + INT8 quantization | TBD | TBD | TBD | TBD | TBD | PENDING |
+| + ToMe r=0.1 | 450ms | ~5.0s | 0.71 | 84.3 | 97.3 | BEST PYTORCH |
+| + ToMe r=0.2 | 375ms | ~4.1s | 1.04 | 63.1 | 90.5 | TOO AGGRESSIVE |
+| + Image token pruning 0.5 | 486ms | ~5.3s | 0.90 | 76.3 | 93.9 | NOT WORTH IT |
+| ONNX FP32 | TBD | TBD | TBD | TBD | TBD | PENDING |
+| ONNX FP16 | TBD | TBD | TBD | TBD | TBD | PENDING |
+| ONNX INT8 | TBD | TBD | TBD | TBD | TBD | PENDING |
