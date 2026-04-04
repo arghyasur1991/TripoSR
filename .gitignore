@@ -162,3 +162,9 @@ cython_debug/
 # default output directory
 output/
 outputs/
+
+# Quest optimization artifacts
+models/*.onnx
+models/*.onnx.data
+test_images/novel/*_raw.*
+.DS_Store
