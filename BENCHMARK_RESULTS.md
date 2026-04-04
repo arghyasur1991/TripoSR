@@ -67,9 +67,52 @@ Quest 3 estimates use 11x bandwidth ratio (M4 Max 546 GB/s vs Quest 3 ~51 GB/s).
 - Output shape preserved: `(1, 3, 40, 64, 64)` -- matches baseline
 - Mean absolute difference in scene_codes vs baseline: 30.49 (expected, since tokens are merged)
 
-### Speed/Quality Results
+### Speed Results (forward pass only, no mesh extraction)
 
-*(To be filled after `reconstruct_compare.py` runs)*
+| Variant | Mean (s) | Speedup | Quest 3 est. |
+|---|---|---|---|
+| Baseline | 0.524 | 1.00x | ~5.8s |
+| ToMe r=0.1, layers [4,8,12] | 0.450 | 1.17x | ~5.0s |
+| ToMe r=0.2, layers [4,8,12] | 0.375 | 1.40x | ~4.1s |
+| ToMe r=0.3, layers [4,8,12] | 0.323 | 1.62x | ~3.6s |
+
+### Quality Results (20-image test set)
+
+**Note:** Baseline meshes regenerated with proper gray-background preprocessing (alpha composited
+onto 0.5 gray + resize_foreground, matching official `run.py`). Volume IoU not shown -- marching
+cubes meshes aren't watertight, making voxel containment unreliable.
+
+| Variant | Mean CD (%) | Mean F@1% | Mean F@2% | Verts Ratio | Quality Assessment |
+|---|---|---|---|---|---|
+| **ToMe r=0.1** | 0.708 | 84.2 | 97.3 | 1.01x | Good -- most images acceptable |
+| **ToMe r=0.2** | 1.037 | 63.1 | 90.5 | 1.07x | Moderate -- noticeable degradation |
+| **ToMe r=0.3** | 1.401 | 48.6 | 80.8 | 1.09x | Poor -- too aggressive |
+
+**Per-image details (ToMe r=0.1, best quality/speed tradeoff):**
+
+| Image | CD (%) | F@1% | F@2% | Status |
+|---|---|---|---|---|
+| chair.png | 0.639 | 85.7 | 98.9 | PASS |
+| flamingo.png | 0.459 | 97.4 | 99.6 | PASS |
+| hamburger.png | 0.538 | 95.1 | 100.0 | PASS |
+| robot.png | 0.685 | 83.1 | 99.3 | MARGINAL |
+| teapot.png | 0.543 | 96.2 | 100.0 | PASS |
+| backpack_nobg.png | 0.619 | 89.7 | 100.0 | PASS |
+| **book_nobg.png** | **1.343** | **49.1** | 83.6 | **FAIL** |
+| bottle_nobg.png | 0.543 | 94.0 | 100.0 | PASS |
+| chair_nobg.png | 0.601 | 91.0 | 99.9 | PASS |
+| clock_nobg.png | 0.795 | 73.2 | 100.0 | MARGINAL |
+| lamp_nobg.png | 0.827 | 76.1 | 93.5 | MARGINAL |
+| mug_nobg.png | 0.746 | 77.0 | 100.0 | MARGINAL |
+| shoe_nobg.png | 0.469 | 97.6 | 100.0 | PASS |
+| teddy_bear_nobg.png | 0.631 | 89.7 | 100.0 | PASS |
+| **vase_nobg.png** | **1.325** | **65.8** | 80.0 | **FAIL** |
+
+**Key Findings:**
+- Triplane tokens are more sensitive to merging than ViT image tokens -- each encodes a distinct spatial region
+- r=0.1 is the practical limit for acceptable quality (2/20 images fail, rest pass/marginal)
+- r=0.2+ causes significant geometric distortion, especially on complex/thin structures
+- Best tradeoff: **ToMe r=0.1 gives 1.17x speedup with mostly acceptable quality**
 
 ---
 
@@ -87,10 +130,11 @@ Quest 3 estimates use 11x bandwidth ratio (M4 Max 546 GB/s vs Quest 3 ~51 GB/s).
 
 ## Cumulative Results Summary
 
-| Variant | Forward (M4 Max) | Quest 3 est. | CD (%) | F@1% | Vol IoU | Status |
+| Variant | Forward (M4 Max) | Quest 3 est. | CD (%) | F@1% | F@2% | Status |
 |---|---|---|---|---|---|---|
 | Baseline (PyTorch) | 560ms | ~6.2s | 0 (ref) | 100 (ref) | 100 (ref) | MEASURED |
-| + ToMe (triplane) | TBD | TBD | TBD | TBD | TBD | IN PROGRESS |
+| + ToMe r=0.1 | 450ms | ~5.0s | 0.71 | 84.2 | 97.3 | MEASURED |
+| + ToMe r=0.2 | 375ms | ~4.1s | 1.04 | 63.1 | 90.5 | MEASURED |
 | + Image token pruning | TBD | TBD | TBD | TBD | TBD | PENDING |
 | + FP16 quantization | TBD | TBD | TBD | TBD | TBD | PENDING |
 | + INT8 quantization | TBD | TBD | TBD | TBD | TBD | PENDING |

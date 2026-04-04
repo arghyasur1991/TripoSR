@@ -24,6 +24,7 @@ import torch
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent))
+from image_utils import prepare_image
 from tsr.system import TSR
 
 
@@ -164,7 +165,7 @@ def main():
         img_path = candidates[0]
 
     print(f"Image: {img_path}")
-    image = Image.open(img_path).convert("RGB")
+    image = prepare_image(img_path)
 
     print("Loading model from HuggingFace (stabilityai/TripoSR)...")
     model = TSR.from_pretrained(
