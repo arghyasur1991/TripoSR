@@ -110,7 +110,29 @@ def main():
 
         unity_codes = triposr.run(None, {input_name: unity})[0]
         python_codes = triposr.run(None, {input_name: python})[0]
-        compare_tensors("Scene Codes", unity_codes, python_codes)
+        compare_tensors("Scene Codes (Unity preproc vs Python preproc)", unity_codes, python_codes)
+
+        onnx_ref_path = str(Path(args.unity_bin).parent / "onnx_scene_codes.bin")
+        python_codes.astype(np.float32).tofile(onnx_ref_path)
+        with open(onnx_ref_path + ".meta.txt", "w") as f:
+            f.write(f"dtype=float32\nshape={','.join(str(d) for d in python_codes.shape)}\n")
+        print(f"  Saved ONNX scene codes: {onnx_ref_path}")
+
+    sentis_sc_path = str(Path(args.unity_bin).parent / "sentis_scene_codes.bin")
+    if Path(sentis_sc_path).exists():
+        sentis_meta = sentis_sc_path + ".meta.txt"
+        meta = {}
+        with open(sentis_meta) as f:
+            for line in f:
+                k, v = line.strip().split("=", 1)
+                meta[k] = v
+        sc_shape = tuple(int(x) for x in meta["shape"].split(","))
+        sentis_codes = np.fromfile(sentis_sc_path, dtype=np.float32).reshape(sc_shape)
+
+        if args.onnx_dir:
+            compare_tensors("Scene Codes (Sentis vs ONNX, same Python input)", sentis_codes, python_codes)
+        print(f"  Sentis scene codes: shape={sentis_codes.shape}, "
+              f"range=[{sentis_codes.min():.4f}, {sentis_codes.max():.4f}]")
 
     print("\nDone.")
 
