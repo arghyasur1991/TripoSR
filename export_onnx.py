@@ -7,11 +7,17 @@ Also exports the NeRF decoder separately for on-device mesh extraction.
 
 All target ONNX opset 15 for Unity Sentis 2.5.0 compatibility.
 
+Graph optimization (opt_level=1) applies standard ONNX-compatible passes
+(constant folding, dead node elimination, CSE) without introducing ORT-specific
+fused operators. This keeps the graph clean for Unity Sentis import.
+
 Usage:
-    python export_onnx.py                       # FP32 + FP16 + INT8
-    python export_onnx.py --fp32-only           # FP32 only
+    python export_onnx.py                       # FP32 + FP16 + INT8 (optimized)
+    python export_onnx.py --fp32-only           # FP32 only (optimized)
+    python export_onnx.py --no-optimize         # Skip graph optimization
     python export_onnx.py --benchmark           # export + benchmark
     python export_onnx.py --benchmark-only      # benchmark existing models
+    python export_onnx.py --experimental --tome 0.1  # ToMe (experimental)
 """
 
 import argparse
@@ -375,6 +381,33 @@ def export_decoder(model: TSR, output_path: Path, opset: int = 15):
 # Quantization
 # ---------------------------------------------------------------------------
 
+def optimize_graph(input_path: Path, output_path: Path = None):
+    """Apply ORT basic graph optimizations (opt_level=1) to an ONNX model.
+
+    Only uses standard ONNX-compatible transforms (constant folding, dead node
+    elimination, CSE). Does NOT introduce ORT-specific fused operators, keeping
+    the graph clean for Unity Sentis import.
+    """
+    import onnxruntime as ort
+
+    if output_path is None:
+        output_path = input_path
+
+    log(f"Optimizing graph (opt_level=1): {input_path.name}")
+    t0 = time.time()
+
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+    so.optimized_model_filepath = str(output_path)
+
+    # Create session to trigger optimization and save
+    ort.InferenceSession(str(input_path), so, providers=["CPUExecutionProvider"])
+
+    orig_size = input_path.stat().st_size / 1e6
+    opt_size = output_path.stat().st_size / 1e6
+    log(f"  Optimized: {opt_size:.1f}MB (was {orig_size:.1f}MB) [{time.time()-t0:.1f}s]")
+
+
 def convert_fp16(input_path: Path, output_path: Path):
     """Convert FP32 ONNX to FP16 using ORT transformer optimizer."""
     from onnxruntime.transformers.optimizer import optimize_model
@@ -498,19 +531,26 @@ def main():
     parser = argparse.ArgumentParser(description="Export TripoSR teacher to ONNX")
     parser.add_argument("--opset", type=int, default=15)
     parser.add_argument("--fp32-only", action="store_true", help="Skip FP16 and INT8")
+    parser.add_argument("--no-optimize", action="store_true",
+                        help="Skip ORT opt_level=1 graph optimization")
     parser.add_argument("--skip-decoder", action="store_true")
     parser.add_argument("--skip-verify", action="store_true")
     parser.add_argument("--benchmark", action="store_true", help="Benchmark after export")
     parser.add_argument("--benchmark-only", action="store_true", help="Only benchmark existing")
+    parser.add_argument("--experimental", action="store_true",
+                        help="Enable experimental features (ToMe export)")
     parser.add_argument("--tome", type=float, default=None,
-                        help="Export ToMe variant with given merge ratio (e.g. 0.1)")
+                        help="[experimental] Export ToMe variant with given merge ratio")
     parser.add_argument("--tome-layers", nargs="+", type=int, default=[4, 8, 12],
-                        help="ToMe merge layers (default: 4 8 12)")
+                        help="[experimental] ToMe merge layers (default: 4 8 12)")
     parser.add_argument("--tome-only", action="store_true",
-                        help="Only export ToMe variant (skip vanilla)")
+                        help="[experimental] Only export ToMe variant (skip vanilla)")
     parser.add_argument("--runs", type=int, default=10, help="Benchmark runs")
     parser.add_argument("--output-dir", type=Path, default=MODELS_DIR)
     args = parser.parse_args()
+
+    if (args.tome is not None or args.tome_only) and not args.experimental:
+        parser.error("ToMe export requires --experimental flag")
 
     out_dir = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -541,6 +581,9 @@ def main():
 
             ref_out = export_fp32(teacher, fp32_path, args.opset)
             ref_np = ref_out.numpy()
+
+            if not args.no_optimize:
+                optimize_graph(fp32_path)
 
             if not args.skip_verify:
                 results.append(verify_onnx(fp32_path, img_np, ref_np, "image", "FP32"))
@@ -576,6 +619,9 @@ def main():
                 merge_ratio=tome_ratio, merge_layers=args.tome_layers,
             )
 
+            if not args.no_optimize:
+                optimize_graph(tome_fp32_path)
+
             if not args.skip_verify:
                 results.append(verify_onnx(
                     tome_fp32_path, img_np, tome_ref_np,
@@ -600,6 +646,8 @@ def main():
             log("NERF DECODER")
             log("=" * 60)
             ref_dec, dummy_feat = export_decoder(teacher, dec_fp32_path, args.opset)
+            if not args.no_optimize:
+                optimize_graph(dec_fp32_path)
             if not args.skip_verify:
                 results.append(verify_onnx(
                     dec_fp32_path, dummy_feat.numpy(), ref_dec.numpy(),
