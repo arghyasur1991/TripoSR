@@ -13,6 +13,7 @@ Usage:
     python reconstruct_compare.py --tome 0.1 0.2 0.3      # sweep ratios
     python reconstruct_compare.py --onnx models/fp16.onnx # compare ONNX variant
     python reconstruct_compare.py --all                   # run all available variants
+    python reconstruct_compare.py --e2e                   # full rembg+onnx pipeline on Unity test images
 """
 
 import argparse
@@ -107,6 +108,89 @@ def _onnx_forward(onnx_session, image_path: Path) -> np.ndarray:
     if input_meta.type == "tensor(float16)":
         img_np = img_np.astype(np.float16)
     return onnx_session.run(None, {"image": img_np})[0].astype(np.float32)
+
+
+def rembg_onnx_to_rgba(rembg_session, image_path: Path) -> Image.Image:
+    """Run u2netp ONNX on a raw image and return RGBA PIL image with alpha mask.
+
+    Replicates the exact rembg preprocessing:
+    1. Resize to 320x320 with LANCZOS
+    2. Normalize to [0, max] then subtract ImageNet mean/std
+    3. Run inference, min-max normalize output
+    4. Resize mask back with LANCZOS
+    """
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+
+    img = Image.open(image_path).convert("RGB")
+    orig_w, orig_h = img.size
+
+    resized = img.resize((320, 320), Image.LANCZOS)
+    arr = np.array(resized, dtype=np.float32)
+    arr = arr / max(np.max(arr), 1e-6)
+
+    # ImageNet normalization per channel
+    tmp = np.zeros((arr.shape[0], arr.shape[1], 3), dtype=np.float32)
+    tmp[:, :, 0] = (arr[:, :, 0] - mean[0]) / std[0]
+    tmp[:, :, 1] = (arr[:, :, 1] - mean[1]) / std[1]
+    tmp[:, :, 2] = (arr[:, :, 2] - mean[2]) / std[2]
+    inp = tmp.transpose(2, 0, 1)[np.newaxis]  # (1, 3, 320, 320)
+
+    input_name = rembg_session.get_inputs()[0].name
+    pred = rembg_session.run(None, {input_name: inp})[0][:, 0, :, :]
+
+    # Min-max normalization matching rembg
+    ma, mi = np.max(pred), np.min(pred)
+    pred = (pred - mi) / (ma - mi + 1e-8)
+    mask = np.squeeze(pred)
+
+    mask_img = Image.fromarray((mask * 255).astype(np.uint8), mode="L")
+    mask_img = mask_img.resize((orig_w, orig_h), Image.LANCZOS)
+
+    rgba = img.copy()
+    rgba.putalpha(mask_img)
+    return rgba
+
+
+def _preprocess_for_onnx_with_rembg(rembg_session, image_path: Path) -> np.ndarray:
+    """Full rembg → preprocess pipeline for raw images. Returns (1, 3, 512, 512)."""
+    from tsr.utils import ImagePreprocessor, resize_foreground
+
+    img = Image.open(image_path)
+    if img.mode == "RGBA":
+        # Already has alpha — use standard pipeline
+        rgba = img
+    else:
+        # Raw image — run rembg ONNX to get alpha
+        rgba = rembg_onnx_to_rgba(rembg_session, image_path)
+
+    # Match prepare_image: resize_foreground + composite on gray
+    rgba = resize_foreground(rgba, 0.85)
+    arr = np.array(rgba).astype(np.float32) / 255.0
+    rgb = arr[:, :, :3] * arr[:, :, 3:4] + (1 - arr[:, :, 3:4]) * 0.5
+    pil_rgb = Image.fromarray((rgb * 255.0).astype(np.uint8))
+
+    processor = ImagePreprocessor()
+    tensor = processor(pil_rgb, 512)  # (B, H, W, C)
+    return tensor.permute(0, 3, 1, 2).numpy()  # (B, C, H, W)
+
+
+def run_e2e_onnx_inference(
+    rembg_session,
+    onnx_session,
+    decoder_session,
+    model: TSR,
+    image_path: Path,
+    device: str,
+) -> trimesh.Trimesh:
+    """Full end-to-end: rembg ONNX → TripoSR ONNX → decoder ONNX → mesh."""
+    img_np = _preprocess_for_onnx_with_rembg(rembg_session, image_path)
+    input_meta = onnx_session.get_inputs()[0]
+    if input_meta.type == "tensor(float16)":
+        img_np = img_np.astype(np.float16)
+    scene_codes_np = onnx_session.run(None, {"image": img_np})[0].astype(np.float32)
+    scene_codes = torch.from_numpy(scene_codes_np).to(device)
+    return _extract_mesh_onnx_decoder(model, scene_codes, decoder_session, device)
 
 
 def run_onnx_inference(
@@ -565,6 +649,10 @@ def main():
     parser.add_argument("--onnx", nargs="+", type=Path, help="Test ONNX model variant(s)")
     parser.add_argument("--onnx-decoder", type=Path, help="Decoder ONNX model for full-pipeline validation")
     parser.add_argument("--all", action="store_true", help="Run all available variants")
+    parser.add_argument("--e2e", action="store_true",
+                        help="Full rembg+triposr+decoder ONNX pipeline on Unity test images (raw + RGBA)")
+    parser.add_argument("--e2e-images", nargs="*", type=Path,
+                        help="Specific images for --e2e (default: Unity test set)")
     parser.add_argument("--device", default="auto", help="Device: auto, cpu, mps, cuda")
     parser.add_argument("--no-latency", action="store_true", help="Skip latency measurement")
     args = parser.parse_args()
@@ -656,6 +744,98 @@ def main():
             report = format_report(name, results)
             print(f"\n{report}")
             save_results(name, results, report)
+
+    # --- E2E: full rembg + triposr + decoder ONNX pipeline ---
+    if args.e2e:
+        import onnxruntime as ort
+
+        models_dir = Path(__file__).parent / "models"
+        rembg_path = models_dir / "u2netp.onnx"
+        triposr_path = models_dir / "triposr_fp32.onnx"
+        decoder_path = models_dir / "nerf_decoder.onnx"
+
+        for p in [rembg_path, triposr_path, decoder_path]:
+            if not p.exists():
+                print(f"ERROR: Missing model: {p}")
+                sys.exit(1)
+
+        print(f"\n--- E2E: rembg + triposr_fp32 + nerf_decoder (full ONNX) ---")
+        rembg_sess = ort.InferenceSession(str(rembg_path), providers=["CPUExecutionProvider"])
+        triposr_sess = ort.InferenceSession(str(triposr_path), providers=["CPUExecutionProvider"])
+        decoder_sess = ort.InferenceSession(str(decoder_path), providers=["CPUExecutionProvider"])
+
+        # Collect test images: use --e2e-images if provided, else the Unity test set
+        if args.e2e_images:
+            e2e_images = [p for p in args.e2e_images if p.exists()]
+        else:
+            # Unity test images: mix of raw (needs rembg) and RGBA (already processed)
+            test_dir = Path(__file__).parent / "test_images"
+            unity_names = [
+                ("novel", "backpack_raw.jpg"),
+                ("examples", "chair.png"),
+                ("novel", "clock_raw.jpg"),
+                ("examples", "hamburger.png"),
+                ("examples", "robot.png"),
+                ("novel", "shoe_raw.jpg"),
+            ]
+            e2e_images = [test_dir / sub / name for sub, name in unity_names if (test_dir / sub / name).exists()]
+
+        if not e2e_images:
+            print("No e2e test images found!")
+        else:
+            print(f"Test images ({len(e2e_images)}):")
+            for p in e2e_images:
+                print(f"  {p.name} ({'raw→rembg' if p.suffix in ('.jpg', '.jpeg') else 'RGBA'})")
+
+            results = []
+            for img_path in e2e_images:
+                rel = img_path.name
+                print(f"  [e2e] {rel} ...", end="", flush=True)
+
+                # Generate baseline from the standard pipeline (RGBA/nobg input)
+                # For raw images, use the corresponding nobg version for baseline
+                if "_raw" in img_path.stem:
+                    nobg_name = img_path.stem.replace("_raw", "_nobg") + ".png"
+                    nobg_path = img_path.parent / nobg_name
+                    if nobg_path.exists():
+                        baseline_src = nobg_path
+                    else:
+                        print(f" SKIP (no nobg baseline for {img_path.name})")
+                        continue
+                else:
+                    baseline_src = img_path
+
+                baseline_cache = BASELINE_CACHE / f"{baseline_src.stem}.obj"
+                if not baseline_cache.exists():
+                    print(f" generating baseline...", end="", flush=True)
+                    baseline_mesh = run_inference(model, baseline_src, device)
+                    BASELINE_CACHE.mkdir(parents=True, exist_ok=True)
+                    baseline_mesh.export(str(baseline_cache))
+                else:
+                    baseline_mesh = trimesh.load(str(baseline_cache), process=False)
+
+                # Run full e2e ONNX
+                t0 = time.perf_counter()
+                e2e_mesh = run_e2e_onnx_inference(
+                    rembg_sess, triposr_sess, decoder_sess, model, img_path, device)
+                elapsed = time.perf_counter() - t0
+
+                metrics = compute_metrics(baseline_mesh, e2e_mesh)
+
+                variant_dir = RESULTS_DIR / "e2e_rembg_onnx"
+                variant_dir.mkdir(parents=True, exist_ok=True)
+                e2e_mesh.export(str(variant_dir / f"{img_path.stem}.obj"))
+
+                result = {"image": rel, "metrics": metrics, "latency": elapsed}
+                results.append(result)
+                status = status_for_metrics(metrics)
+                print(f" CD={metrics['cd_pct']:.3f}% F@1%={metrics['f_score_1pct']:.1f} "
+                      f"IoU={metrics['volume_iou']:.1f} [{status}] {elapsed:.1f}s")
+
+            if results:
+                report = format_report("e2e_rembg_onnx", results)
+                print(f"\n{report}")
+                save_results("e2e_rembg_onnx", results, report)
 
 
 if __name__ == "__main__":
