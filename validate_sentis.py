@@ -173,12 +173,22 @@ def main():
         sentis_codes = load_bin(sentis_sc_path)
         if sentis_codes.size == onnx_scene_codes.size:
             sentis_codes = sentis_codes.reshape(onnx_scene_codes.shape)
-            compare("Scene Codes (ONNX vs Sentis)", onnx_scene_codes, sentis_codes)
+            compare("Scene Codes (ONNX vs Sentis .sentis)", onnx_scene_codes, sentis_codes)
         else:
             print(f"\n!! Size mismatch: ONNX={onnx_scene_codes.size}, Sentis={sentis_codes.size}")
     else:
         print(f"\n!! Sentis scene codes not found at {sentis_sc_path}")
         print("   Run 'Run from Python Tensor (.bin)' in Unity first to generate it.")
+
+    # Also check ONNX-direct scene codes (bypasses .sentis serialization)
+    onnx_direct_path = str(Path(debug_dir) / "sentis_onnx_direct_scene_codes.bin")
+    if Path(onnx_direct_path).exists():
+        direct_codes = load_bin(onnx_direct_path)
+        if direct_codes.size == onnx_scene_codes.size:
+            direct_codes = direct_codes.reshape(onnx_scene_codes.shape)
+            compare("Scene Codes (ONNX vs Sentis ONNX-direct)", onnx_scene_codes, direct_codes)
+        else:
+            print(f"\n!! Size mismatch: ONNX={onnx_scene_codes.size}, Direct={direct_codes.size}")
 
     # Step 3: Compare density fields (if --full)
     if args.full:
