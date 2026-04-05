@@ -304,6 +304,51 @@ def _print_section(title: str):
 # Graph optimization
 # ===========================================================================
 
+def transformer_optimize(input_path: Path, output_path: Path = None,
+                         num_heads: int = 16, hidden_size: int = 1024):
+    """Apply ORT transformer-specific fusions (SkipLayerNorm, Gelu, BiasGelu).
+
+    Must run on raw torch-exported models BEFORE ORT graph optimization,
+    since ORT's basic passes create FusedMatMul/SimplifiedLayerNorm ops
+    that the transformer optimizer can't pattern-match through.
+
+    Fuses: residual Add + LayerNorm → SkipLayerNormalization (~68 instances),
+    Erf-based GELU → Gelu op (~28 instances). ~6% op count reduction.
+    """
+    import onnx
+    from onnxruntime.transformers import optimizer
+    from onnxruntime.transformers.fusion_options import FusionOptions
+
+    if output_path is None:
+        output_path = input_path
+
+    m = onnx.load(str(input_path))
+    ops_before = len(m.graph.node)
+
+    if m.producer_name != "pytorch":
+        m.producer_name = "pytorch"
+        onnx.save(m, str(input_path))
+
+    log(f"  Transformer optimize: {input_path.name}")
+    t0 = time.time()
+
+    opts = FusionOptions("bert")
+    opts.enable_attention = True
+    opts.use_multi_head_attention = True
+
+    m_opt = optimizer.optimize_model(
+        str(input_path),
+        model_type="bert",
+        num_heads=num_heads,
+        hidden_size=hidden_size,
+        optimization_options=opts
+    )
+    m_opt.save_model_to_file(str(output_path))
+
+    ops_after = len(m_opt.model.graph.node)
+    log(f"    {ops_after} ops (was {ops_before}, -{ops_before - ops_after}) [{time.time()-t0:.1f}s]")
+
+
 def optimize_graph(input_path: Path, output_path: Path = None):
     """Apply ORT graph optimizations (opt_level=ALL).
 
@@ -967,7 +1012,13 @@ def export_triposr_variant(model: TSR, out_dir: Path, prefix: str, label: str,
         # Split from the unoptimized graph (tensor names intact)
         p1_fp32, p2_fp32 = split_model(fp32_path, out_dir, prefix)
 
-        # Now optimize the full model (for benchmarking) and split parts separately
+        # Transformer-specific fusions on raw parts (SkipLayerNorm, Gelu).
+        # Must run BEFORE ORT optimize since ORT creates FusedMatMul/etc that
+        # block the transformer optimizer's pattern matching.
+        transformer_optimize(p1_fp32)
+        transformer_optimize(p2_fp32)
+
+        # Then ORT graph optimizations on top
         optimize_graph(fp32_path)
         optimize_graph(p1_fp32)
         optimize_graph(p2_fp32)
@@ -1339,6 +1390,8 @@ def main():
             if p1.exists() and p2.exists():
                 import onnxruntime as ort
 
+                transformer_optimize(p1)
+                transformer_optimize(p2)
                 optimize_graph(p1)
                 optimize_graph(p2)
 
