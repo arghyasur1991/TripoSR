@@ -547,6 +547,65 @@ def _collect_rembg_calibration_images(n: int = 8) -> list[np.ndarray]:
     return images
 
 
+def _collect_decoder_calibration_features(
+    models_dir: Path, n_images: int = 8, n_points: int = 4096,
+) -> list[np.ndarray]:
+    """Generate real triplane features from FP32 TripoSR for decoder calibration.
+
+    Runs FP32 Part1+Part2 on calibration images, then does triplane grid
+    sampling with random 3D positions to extract actual decoder inputs.
+    This replaces random N(0,1) data which doesn't represent real feature
+    distributions and causes poor quantization ranges.
+    """
+    import onnxruntime as ort
+    import torch
+    import torch.nn.functional as F
+    from einops import rearrange
+
+    p1_path = models_dir / "triposr_part1_fp32.onnx"
+    p2_path = models_dir / "triposr_part2_fp32.onnx"
+    if not p1_path.exists() or not p2_path.exists():
+        log("    WARNING: FP32 split models not found, falling back to random calibration")
+        sess = ort.InferenceSession(
+            str(models_dir / "nerf_decoder.onnx"), providers=["CPUExecutionProvider"])
+        in_ch = sess.get_inputs()[0].shape[1]
+        del sess
+        return [np.random.randn(n_points, in_ch).astype(np.float32) for _ in range(n_images)]
+
+    images = _collect_calibration_images(n_images)
+    p1_sess = ort.InferenceSession(str(p1_path), providers=["CPUExecutionProvider"])
+    p2_sess = ort.InferenceSession(str(p2_path), providers=["CPUExecutionProvider"])
+
+    p2_input_names = [inp.name for inp in p2_sess.get_inputs()]
+
+    features_list = []
+    for img_np in images:
+        p1_outputs = p1_sess.run(None, {"image": img_np})
+        p2_feed = {name: val for name, val in zip(p2_input_names, p1_outputs)}
+        scene_codes = p2_sess.run(None, p2_feed)[0]
+
+        triplane = torch.from_numpy(scene_codes[0])  # (3, C, H, W)
+        positions = torch.rand(n_points, 3) * 2 - 1  # uniform in [-1, 1]
+
+        indices2D = torch.stack(
+            (positions[..., [0, 1]], positions[..., [0, 2]], positions[..., [1, 2]]),
+            dim=-3,
+        )
+        out = F.grid_sample(
+            rearrange(triplane, "Np Cp Hp Wp -> Np Cp Hp Wp", Np=3),
+            rearrange(indices2D, "Np N Nd -> Np () N Nd", Np=3),
+            align_corners=False,
+            mode="bilinear",
+        )
+        feats = rearrange(out, "Np Cp () N -> N (Np Cp)", Np=3)
+        features_list.append(feats.numpy())
+
+    del p1_sess, p2_sess
+    log(f"    Collected {len(features_list)} decoder calibration batches "
+        f"({n_points} points each) from FP32 triplane features")
+    return features_list
+
+
 def quantize_int8_qdq(input_path: Path, output_path: Path,
                       calibration_data: list[np.ndarray] | list[dict[str, np.ndarray]],
                       input_name: str | None = None):
@@ -1001,7 +1060,7 @@ def export_decoder(model: TSR, output_dir: Path, opset: int = 15,
 
         if qdq:
             int8_qdq_path = output_dir / "nerf_decoder_int8_qdq.onnx"
-            cal_data = [np.random.randn(1024, in_ch).astype(np.float32) for _ in range(8)]
+            cal_data = _collect_decoder_calibration_features(output_dir)
             quantize_int8_qdq(fp32_path, int8_qdq_path, cal_data,
                               input_name="triplane_features")
             if not skip_verify:
@@ -1301,11 +1360,7 @@ def main():
         if not args.skip_decoder:
             dec_fp32 = out_dir / "nerf_decoder.onnx"
             if dec_fp32.exists():
-                import onnxruntime as ort
-                sess = ort.InferenceSession(str(dec_fp32), providers=["CPUExecutionProvider"])
-                in_ch = sess.get_inputs()[0].shape[1]
-                del sess
-                cal = [np.random.randn(1024, in_ch).astype(np.float32) for _ in range(8)]
+                cal = _collect_decoder_calibration_features(out_dir)
                 dec_qdq = out_dir / "nerf_decoder_int8_qdq.onnx"
                 quantize_int8_qdq(dec_fp32, dec_qdq, cal, input_name="triplane_features")
             else:

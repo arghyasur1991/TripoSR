@@ -329,6 +329,15 @@ def _extract_mesh_onnx_decoder(
         density_result = query_triplane_onnx(grid_verts, scene_code)
         density = density_result["density_act"]
 
+    above = int((density > threshold).sum())
+    print(f"    density_act: min={density.min():.2f} max={density.max():.2f} "
+          f"mean={density.mean():.2f} std={density.std():.2f} "
+          f">thresh={above}/{density.numel()}")
+    if above == 0:
+        raise ValueError(
+            f"No voxels above threshold {threshold} "
+            f"(max density_act={density.max():.4f})")
+
     v_pos, t_pos_idx = helper(-(density - threshold))
     v_pos = scale_tensor(
         v_pos, helper.points_range,
@@ -862,6 +871,10 @@ def main():
                 dec_qdq = models_dir / "nerf_decoder_int8_qdq.onnx"
                 if all(p.exists() for p in [p1_qdq, p2_qdq, dec_qdq]):
                     e2e_variants.append(("e2e_split_int8_qdq", rembg_path, p1_qdq, p2_qdq, dec_qdq))
+
+                # INT8-QDQ scene codes + FP32 decoder (isolates decoder vs scene code error)
+                if all(p.exists() for p in [p1_qdq, p2_qdq, dec_fp32]):
+                    e2e_variants.append(("e2e_split_int8_qdq_fp32dec", rembg_path, p1_qdq, p2_qdq, dec_fp32))
 
                 # Full (unsplit) FP32 for reference
                 triposr_full = models_dir / "triposr_fp32.onnx"
