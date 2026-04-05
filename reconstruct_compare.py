@@ -183,12 +183,46 @@ def run_e2e_onnx_inference(
     image_path: Path,
     device: str,
 ) -> trimesh.Trimesh:
-    """Full end-to-end: rembg ONNX → TripoSR ONNX → decoder ONNX → mesh."""
+    """Full end-to-end: rembg ONNX → TripoSR ONNX (full) → decoder ONNX → mesh."""
     img_np = _preprocess_for_onnx_with_rembg(rembg_session, image_path)
     input_meta = onnx_session.get_inputs()[0]
     if input_meta.type == "tensor(float16)":
         img_np = img_np.astype(np.float16)
     scene_codes_np = onnx_session.run(None, {"image": img_np})[0].astype(np.float32)
+    scene_codes = torch.from_numpy(scene_codes_np).to(device)
+    return _extract_mesh_onnx_decoder(model, scene_codes, decoder_session, device)
+
+
+def _run_split_forward(part1_session, part2_session, img_np: np.ndarray) -> np.ndarray:
+    """Run split TripoSR (part1 → part2) and return scene_codes as float32."""
+    p1_inp = img_np
+    if part1_session.get_inputs()[0].type == "tensor(float16)":
+        p1_inp = img_np.astype(np.float16)
+    p1_outs = part1_session.run(None, {"image": p1_inp})
+    p1_names = [o.name for o in part1_session.get_outputs()]
+
+    p2_inputs = {}
+    for name, val in zip(p1_names, p1_outs):
+        meta = next((i for i in part2_session.get_inputs() if i.name == name), None)
+        if meta and meta.type == "tensor(float16)":
+            p2_inputs[name] = val.astype(np.float16)
+        else:
+            p2_inputs[name] = val
+    return part2_session.run(None, p2_inputs)[0].astype(np.float32)
+
+
+def run_e2e_split_onnx_inference(
+    rembg_session,
+    part1_session,
+    part2_session,
+    decoder_session,
+    model: TSR,
+    image_path: Path,
+    device: str,
+) -> trimesh.Trimesh:
+    """Full end-to-end: rembg ONNX → TripoSR split (part1+part2) → decoder ONNX → mesh."""
+    img_np = _preprocess_for_onnx_with_rembg(rembg_session, image_path)
+    scene_codes_np = _run_split_forward(part1_session, part2_session, img_np)
     scene_codes = torch.from_numpy(scene_codes_np).to(device)
     return _extract_mesh_onnx_decoder(model, scene_codes, decoder_session, device)
 
@@ -712,7 +746,7 @@ def main():
                 "tome_ratio": ratio, "tome_layers": [4, 8, 12],
             })
         models_dir = Path(__file__).parent / "models"
-        for onnx_name in ["triposr_fp32.onnx", "triposr_fp16.onnx", "triposr_int8.onnx"]:
+        for onnx_name in ["triposr_fp32.onnx"]:
             p = models_dir / onnx_name
             if p.exists():
                 onnx_variants.append(p)
@@ -745,30 +779,16 @@ def main():
             print(f"\n{report}")
             save_results(name, results, report)
 
-    # --- E2E: full rembg + triposr + decoder ONNX pipeline ---
+    # --- E2E: full rembg + triposr (split) + decoder ONNX pipeline ---
     if args.e2e:
         import onnxruntime as ort
 
         models_dir = Path(__file__).parent / "models"
-        rembg_path = models_dir / "u2netp.onnx"
-        triposr_path = models_dir / "triposr_fp32.onnx"
-        decoder_path = models_dir / "nerf_decoder.onnx"
 
-        for p in [rembg_path, triposr_path, decoder_path]:
-            if not p.exists():
-                print(f"ERROR: Missing model: {p}")
-                sys.exit(1)
-
-        print(f"\n--- E2E: rembg + triposr_fp32 + nerf_decoder (full ONNX) ---")
-        rembg_sess = ort.InferenceSession(str(rembg_path), providers=["CPUExecutionProvider"])
-        triposr_sess = ort.InferenceSession(str(triposr_path), providers=["CPUExecutionProvider"])
-        decoder_sess = ort.InferenceSession(str(decoder_path), providers=["CPUExecutionProvider"])
-
-        # Collect test images: use --e2e-images if provided, else the Unity test set
+        # Collect test images
         if args.e2e_images:
             e2e_images = [p for p in args.e2e_images if p.exists()]
         else:
-            # Unity test images: mix of raw (needs rembg) and RGBA (already processed)
             test_dir = Path(__file__).parent / "test_images"
             unity_names = [
                 ("novel", "backpack_raw.jpg"),
@@ -778,64 +798,127 @@ def main():
                 ("examples", "robot.png"),
                 ("novel", "shoe_raw.jpg"),
             ]
-            e2e_images = [test_dir / sub / name for sub, name in unity_names if (test_dir / sub / name).exists()]
+            e2e_images = [test_dir / sub / name for sub, name in unity_names
+                          if (test_dir / sub / name).exists()]
 
         if not e2e_images:
             print("No e2e test images found!")
         else:
-            print(f"Test images ({len(e2e_images)}):")
+            print(f"\nE2E test images ({len(e2e_images)}):")
             for p in e2e_images:
                 print(f"  {p.name} ({'raw→rembg' if p.suffix in ('.jpg', '.jpeg') else 'RGBA'})")
 
-            results = []
+            # Ensure baselines exist for all e2e images
+            BASELINE_CACHE.mkdir(parents=True, exist_ok=True)
             for img_path in e2e_images:
-                rel = img_path.name
-                print(f"  [e2e] {rel} ...", end="", flush=True)
-
-                # Generate baseline from the standard pipeline (RGBA/nobg input)
-                # For raw images, use the corresponding nobg version for baseline
                 if "_raw" in img_path.stem:
                     nobg_name = img_path.stem.replace("_raw", "_nobg") + ".png"
-                    nobg_path = img_path.parent / nobg_name
-                    if nobg_path.exists():
-                        baseline_src = nobg_path
-                    else:
-                        print(f" SKIP (no nobg baseline for {img_path.name})")
-                        continue
+                    baseline_src = img_path.parent / nobg_name
                 else:
                     baseline_src = img_path
-
                 baseline_cache = BASELINE_CACHE / f"{baseline_src.stem}.obj"
-                if not baseline_cache.exists():
-                    print(f" generating baseline...", end="", flush=True)
-                    baseline_mesh = run_inference(model, baseline_src, device)
-                    BASELINE_CACHE.mkdir(parents=True, exist_ok=True)
-                    baseline_mesh.export(str(baseline_cache))
-                else:
-                    baseline_mesh = trimesh.load(str(baseline_cache), process=False)
+                if not baseline_cache.exists() and baseline_src.exists():
+                    print(f"  [baseline] {baseline_src.stem} ...", end="", flush=True)
+                    mesh = run_inference(model, baseline_src, device)
+                    mesh.export(str(baseline_cache))
+                    print(f" {mesh.vertices.shape[0]} verts")
 
-                # Run full e2e ONNX
-                t0 = time.perf_counter()
-                e2e_mesh = run_e2e_onnx_inference(
-                    rembg_sess, triposr_sess, decoder_sess, model, img_path, device)
-                elapsed = time.perf_counter() - t0
+            # Define all e2e variant pipelines to test
+            e2e_variants = []
 
-                metrics = compute_metrics(baseline_mesh, e2e_mesh)
+            # FP32 split pipeline
+            rembg_fp32 = models_dir / "u2netp.onnx"
+            p1_fp32 = models_dir / "triposr_part1_fp32.onnx"
+            p2_fp32 = models_dir / "triposr_part2_fp32.onnx"
+            dec_fp32 = models_dir / "nerf_decoder.onnx"
+            if all(p.exists() for p in [rembg_fp32, p1_fp32, p2_fp32, dec_fp32]):
+                e2e_variants.append(("e2e_split_fp32", rembg_fp32, p1_fp32, p2_fp32, dec_fp32))
 
-                variant_dir = RESULTS_DIR / "e2e_rembg_onnx"
-                variant_dir.mkdir(parents=True, exist_ok=True)
-                e2e_mesh.export(str(variant_dir / f"{img_path.stem}.obj"))
+            # FP16 split pipeline
+            rembg_fp16 = models_dir / "u2netp_fp16.onnx"
+            p1_fp16 = models_dir / "triposr_part1_fp16.onnx"
+            p2_fp16 = models_dir / "triposr_part2_fp16.onnx"
+            dec_fp16 = models_dir / "nerf_decoder_fp16.onnx"
+            if all(p.exists() for p in [rembg_fp16, p1_fp16, p2_fp16, dec_fp16]):
+                e2e_variants.append(("e2e_split_fp16", rembg_fp16, p1_fp16, p2_fp16, dec_fp16))
 
-                result = {"image": rel, "metrics": metrics, "latency": elapsed}
-                results.append(result)
-                status = status_for_metrics(metrics)
-                print(f" CD={metrics['cd_pct']:.3f}% F@1%={metrics['f_score_1pct']:.1f} "
-                      f"IoU={metrics['volume_iou']:.1f} [{status}] {elapsed:.1f}s")
+            # INT8 split pipeline
+            rembg_int8 = models_dir / "u2netp_int8.onnx"
+            p1_int8 = models_dir / "triposr_part1_int8.onnx"
+            p2_int8 = models_dir / "triposr_part2_int8.onnx"
+            dec_int8 = models_dir / "nerf_decoder_int8.onnx"
+            if all(p.exists() for p in [rembg_int8, p1_int8, p2_int8, dec_int8]):
+                e2e_variants.append(("e2e_split_int8", rembg_int8, p1_int8, p2_int8, dec_int8))
 
-            if results:
-                report = format_report("e2e_rembg_onnx", results)
-                print(f"\n{report}")
-                save_results("e2e_rembg_onnx", results, report)
+            # Also test full (unsplit) FP32 for reference comparison
+            triposr_full = models_dir / "triposr_fp32.onnx"
+            if all(p.exists() for p in [rembg_fp32, triposr_full, dec_fp32]):
+                e2e_variants.append(("e2e_full_fp32", rembg_fp32, triposr_full, None, dec_fp32))
+
+            if not e2e_variants:
+                print("No complete e2e model sets found! Run export_onnx.py first.")
+            else:
+                for variant_name, rembg_p, p1_or_full, p2_or_none, dec_p in e2e_variants:
+                    is_split = p2_or_none is not None
+                    mode = "split" if is_split else "full"
+                    print(f"\n--- E2E: {variant_name} ({mode}) ---")
+
+                    rembg_sess = ort.InferenceSession(str(rembg_p), providers=["CPUExecutionProvider"])
+                    decoder_sess = ort.InferenceSession(str(dec_p), providers=["CPUExecutionProvider"])
+
+                    if is_split:
+                        p1_sess = ort.InferenceSession(str(p1_or_full), providers=["CPUExecutionProvider"])
+                        p2_sess = ort.InferenceSession(str(p2_or_none), providers=["CPUExecutionProvider"])
+                    else:
+                        full_sess = ort.InferenceSession(str(p1_or_full), providers=["CPUExecutionProvider"])
+
+                    results = []
+                    for img_path in e2e_images:
+                        rel = img_path.name
+                        print(f"  [{variant_name}] {rel} ...", end="", flush=True)
+
+                        if "_raw" in img_path.stem:
+                            nobg_name = img_path.stem.replace("_raw", "_nobg") + ".png"
+                            baseline_src = img_path.parent / nobg_name
+                            if not baseline_src.exists():
+                                print(f" SKIP (no nobg)")
+                                continue
+                        else:
+                            baseline_src = img_path
+
+                        baseline_cache = BASELINE_CACHE / f"{baseline_src.stem}.obj"
+                        if not baseline_cache.exists():
+                            print(f" SKIP (no baseline)")
+                            continue
+                        baseline_mesh = trimesh.load(str(baseline_cache), process=False)
+
+                        t0 = time.perf_counter()
+                        if is_split:
+                            e2e_mesh = run_e2e_split_onnx_inference(
+                                rembg_sess, p1_sess, p2_sess, decoder_sess,
+                                model, img_path, device)
+                        else:
+                            e2e_mesh = run_e2e_onnx_inference(
+                                rembg_sess, full_sess, decoder_sess,
+                                model, img_path, device)
+                        elapsed = time.perf_counter() - t0
+
+                        metrics = compute_metrics(baseline_mesh, e2e_mesh)
+
+                        variant_dir = RESULTS_DIR / variant_name
+                        variant_dir.mkdir(parents=True, exist_ok=True)
+                        e2e_mesh.export(str(variant_dir / f"{img_path.stem}.obj"))
+
+                        result = {"image": rel, "metrics": metrics, "latency": elapsed}
+                        results.append(result)
+                        status = status_for_metrics(metrics)
+                        print(f" CD={metrics['cd_pct']:.3f}% F@1%={metrics['f_score_1pct']:.1f} "
+                              f"IoU={metrics['volume_iou']:.1f} [{status}] {elapsed:.1f}s")
+
+                    if results:
+                        report = format_report(variant_name, results)
+                        print(f"\n{report}")
+                        save_results(variant_name, results, report)
 
 
 if __name__ == "__main__":

@@ -323,6 +323,94 @@ def optimize_graph(input_path: Path, output_path: Path = None):
 
 
 # ===========================================================================
+# Static shape validation
+# ===========================================================================
+
+def validate_static_shapes(model_path: Path, allow_dynamic_axes: dict[str, list[int]] | None = None) -> bool:
+    """Validate that an ONNX model has fully static shapes (no symbolic dims).
+
+    Returns True if all shapes are static (or match allowed exceptions).
+    Prints FAIL and details if any unexpected dynamic dimensions found.
+
+    allow_dynamic_axes: dict mapping tensor name -> list of axis indices
+        where dynamic dims are expected (e.g. {"triplane_features": [0]}).
+    """
+    import onnx
+
+    allow = allow_dynamic_axes or {}
+    model = onnx.load(str(model_path))
+
+    dynamic_found = []
+    for tensor_list, kind in [(model.graph.input, "input"),
+                               (model.graph.output, "output")]:
+        for tensor in tensor_list:
+            name = tensor.name
+            shape = tensor.type.tensor_type.shape
+            if shape is None:
+                dynamic_found.append((kind, name, "no shape info"))
+                continue
+            for i, dim in enumerate(shape.dim):
+                if dim.dim_param:
+                    allowed_axes = allow.get(name, [])
+                    if i in allowed_axes:
+                        continue
+                    dynamic_found.append((kind, name, f"axis {i} = '{dim.dim_param}'"))
+                elif dim.dim_value == 0:
+                    allowed_axes = allow.get(name, [])
+                    if i in allowed_axes:
+                        continue
+                    dynamic_found.append((kind, name, f"axis {i} = unknown(0)"))
+
+    del model
+
+    if dynamic_found:
+        log(f"    FAIL static check: {model_path.name}")
+        for kind, name, detail in dynamic_found:
+            log(f"      {kind} '{name}': {detail}")
+        return False
+    else:
+        log(f"    PASS static check: {model_path.name}")
+        return True
+
+
+def validate_all_models(models_dir: Path) -> bool:
+    """Validate static shapes for all exported models in the directory."""
+    _print_section("STATIC SHAPE VALIDATION")
+
+    decoder_dynamic = {"triplane_features": [0], "density_color": [0]}
+    all_pass = True
+
+    checks = [
+        ("u2netp.onnx", None),
+        ("u2netp_fp16.onnx", None),
+        ("u2netp_int8.onnx", None),
+        ("triposr_fp32.onnx", None),
+        ("triposr_part1_fp32.onnx", None),
+        ("triposr_part2_fp32.onnx", None),
+        ("triposr_part1_fp16.onnx", None),
+        ("triposr_part2_fp16.onnx", None),
+        ("triposr_part1_int8.onnx", None),
+        ("triposr_part2_int8.onnx", None),
+        ("nerf_decoder.onnx", decoder_dynamic),
+        ("nerf_decoder_fp16.onnx", decoder_dynamic),
+        ("nerf_decoder_int8.onnx", decoder_dynamic),
+    ]
+
+    for filename, allowed in checks:
+        path = models_dir / filename
+        if path.exists():
+            if not validate_static_shapes(path, allowed):
+                all_pass = False
+
+    if all_pass:
+        log("\n  All models PASS static shape validation")
+    else:
+        log("\n  WARNING: Some models have unexpected dynamic dimensions")
+
+    return all_pass
+
+
+# ===========================================================================
 # Quantization / conversion
 # ===========================================================================
 
@@ -915,6 +1003,9 @@ def main():
 
             all_results.extend(export_decoder(
                 teacher, out_dir, args.opset, args.fp32_only, args.skip_verify))
+
+        # ---- Static shape validation ----
+        validate_all_models(out_dir)
 
         # ---- Summary ----
         if all_results:
