@@ -385,9 +385,10 @@ def _extract_mesh_onnx_decoder(
         # x-major layout: dim0=x, dim1=y, dim2=z
         coarse_density = coarse_density.reshape(coarse_res, coarse_res, coarse_res)
 
-        raw_mask = coarse_density >= threshold
+        coarse_threshold = threshold * 0.01
+        raw_mask = coarse_density >= coarse_threshold
         from scipy.ndimage import binary_dilation
-        dilated = binary_dilation(raw_mask.cpu().numpy(), iterations=1)
+        dilated = binary_dilation(raw_mask.cpu().numpy(), iterations=2)
         occupied = torch.from_numpy(dilated)
 
         occupied_count = int(occupied.sum())
