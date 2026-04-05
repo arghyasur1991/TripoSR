@@ -823,37 +823,41 @@ def main():
                     mesh.export(str(baseline_cache))
                     print(f" {mesh.vertices.shape[0]} verts")
 
-            # Define all e2e variant pipelines to test
+            # Define all e2e variant pipelines to test.
+            # u2netp FP32 is used for ALL variants — it's only 4.6MB so
+            # quantization gains are negligible, and FP16 breaks due to
+            # Resize op incompatibility.
             e2e_variants = []
+            rembg_path = models_dir / "u2netp.onnx"
 
-            # FP32 split pipeline
-            rembg_fp32 = models_dir / "u2netp.onnx"
-            p1_fp32 = models_dir / "triposr_part1_fp32.onnx"
-            p2_fp32 = models_dir / "triposr_part2_fp32.onnx"
-            dec_fp32 = models_dir / "nerf_decoder.onnx"
-            if all(p.exists() for p in [rembg_fp32, p1_fp32, p2_fp32, dec_fp32]):
-                e2e_variants.append(("e2e_split_fp32", rembg_fp32, p1_fp32, p2_fp32, dec_fp32))
+            if not rembg_path.exists():
+                print(f"ERROR: Missing {rembg_path}")
+            else:
+                # FP32 split pipeline
+                p1_fp32 = models_dir / "triposr_part1_fp32.onnx"
+                p2_fp32 = models_dir / "triposr_part2_fp32.onnx"
+                dec_fp32 = models_dir / "nerf_decoder.onnx"
+                if all(p.exists() for p in [p1_fp32, p2_fp32, dec_fp32]):
+                    e2e_variants.append(("e2e_split_fp32", rembg_path, p1_fp32, p2_fp32, dec_fp32))
 
-            # FP16 split pipeline
-            rembg_fp16 = models_dir / "u2netp_fp16.onnx"
-            p1_fp16 = models_dir / "triposr_part1_fp16.onnx"
-            p2_fp16 = models_dir / "triposr_part2_fp16.onnx"
-            dec_fp16 = models_dir / "nerf_decoder_fp16.onnx"
-            if all(p.exists() for p in [rembg_fp16, p1_fp16, p2_fp16, dec_fp16]):
-                e2e_variants.append(("e2e_split_fp16", rembg_fp16, p1_fp16, p2_fp16, dec_fp16))
+                # FP16 split pipeline (triposr + decoder fp16, rembg fp32)
+                p1_fp16 = models_dir / "triposr_part1_fp16.onnx"
+                p2_fp16 = models_dir / "triposr_part2_fp16.onnx"
+                dec_fp16 = models_dir / "nerf_decoder_fp16.onnx"
+                if all(p.exists() for p in [p1_fp16, p2_fp16, dec_fp16]):
+                    e2e_variants.append(("e2e_split_fp16", rembg_path, p1_fp16, p2_fp16, dec_fp16))
 
-            # INT8 split pipeline
-            rembg_int8 = models_dir / "u2netp_int8.onnx"
-            p1_int8 = models_dir / "triposr_part1_int8.onnx"
-            p2_int8 = models_dir / "triposr_part2_int8.onnx"
-            dec_int8 = models_dir / "nerf_decoder_int8.onnx"
-            if all(p.exists() for p in [rembg_int8, p1_int8, p2_int8, dec_int8]):
-                e2e_variants.append(("e2e_split_int8", rembg_int8, p1_int8, p2_int8, dec_int8))
+                # INT8 split pipeline (triposr + decoder int8, rembg fp32)
+                p1_int8 = models_dir / "triposr_part1_int8.onnx"
+                p2_int8 = models_dir / "triposr_part2_int8.onnx"
+                dec_int8 = models_dir / "nerf_decoder_int8.onnx"
+                if all(p.exists() for p in [p1_int8, p2_int8, dec_int8]):
+                    e2e_variants.append(("e2e_split_int8", rembg_path, p1_int8, p2_int8, dec_int8))
 
-            # Also test full (unsplit) FP32 for reference comparison
-            triposr_full = models_dir / "triposr_fp32.onnx"
-            if all(p.exists() for p in [rembg_fp32, triposr_full, dec_fp32]):
-                e2e_variants.append(("e2e_full_fp32", rembg_fp32, triposr_full, None, dec_fp32))
+                # Full (unsplit) FP32 for reference
+                triposr_full = models_dir / "triposr_fp32.onnx"
+                if all(p.exists() for p in [triposr_full, dec_fp32]):
+                    e2e_variants.append(("e2e_full_fp32", rembg_path, triposr_full, None, dec_fp32))
 
             if not e2e_variants:
                 print("No complete e2e model sets found! Run export_onnx.py first.")

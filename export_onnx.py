@@ -475,12 +475,19 @@ def split_model(input_path: Path, output_dir: Path, prefix: str = "triposr"):
 
     Part 1: image_tokenizer + backbone blocks 0-7
     Part 2: backbone blocks 8-15 + post_processor
+
+    Runs onnx.shape_inference first to populate value_infos for all
+    intermediate tensors — required by the ONNX Extractor.
     """
     import onnx
+    from onnx import shape_inference
     from onnx.utils import Extractor
 
     log(f"\n  Splitting {input_path.name} at block 8 boundary...")
-    model = onnx.load(str(input_path))
+    log(f"    Running shape inference...")
+    model = shape_inference.infer_shapes(
+        onnx.load(str(input_path)), data_prop=True
+    )
     orig_input = model.graph.input[0].name
     orig_output = model.graph.output[0].name
     log(f"    {len(model.graph.node)} nodes, input={orig_input}, output={orig_output}")
@@ -496,6 +503,20 @@ def split_model(input_path: Path, output_dir: Path, prefix: str = "triposr"):
 
     ext2 = Extractor(model)
     part2 = ext2.extract_model(SPLIT_BOUNDARY_TENSORS, [orig_output])
+
+    # Fix any symbolic dims that shape inference couldn't resolve statically.
+    # The full model uses static shapes, so all split tensor dims are known.
+    known_shapes = {
+        "/Reshape_output_0": [1, 1025, 768],
+        "/backbone/transformer_blocks.7/Add_2_output_0": [1, 3072, 1024],
+    }
+    for inp in part2.graph.input:
+        if inp.name in known_shapes:
+            for i, dim_val in enumerate(known_shapes[inp.name]):
+                dim = inp.type.tensor_type.shape.dim[i]
+                dim.ClearField("dim_param")
+                dim.dim_value = dim_val
+
     onnx.save(part2, str(part2_path))
     log(f"    Part 2: {part2_path.name} ({part2_path.stat().st_size/1e6:.1f}MB, "
         f"{len(part2.graph.node)} nodes)")
@@ -572,10 +593,15 @@ def export_u2netp(output_dir: Path, target_opset: int = 15, fp32_only: bool = Fa
         results.append(_verify_u2netp(fp32_path, "u2netp FP32"))
 
     if not fp32_only:
-        fp16_path, int8_path = quantize_all(fp32_path, "u2netp")
-        if not skip_verify:
-            results.append(_verify_u2netp(fp16_path, "u2netp FP16"))
-            results.append(_verify_u2netp(int8_path, "u2netp INT8"))
+        try:
+            fp16_path, int8_path = quantize_all(fp32_path, "u2netp")
+            if not skip_verify:
+                results.append(_verify_u2netp(fp16_path, "u2netp FP16"))
+                results.append(_verify_u2netp(int8_path, "u2netp INT8"))
+        except Exception as e:
+            log(f"  WARNING: u2netp quantization failed: {e}")
+            log(f"  u2netp is only {fp32_path.stat().st_size/1e6:.1f}MB — "
+                f"FP32 is fine for deployment.")
 
     return results
 
@@ -650,7 +676,11 @@ def export_triposr_variant(model: TSR, out_dir: Path, prefix: str, label: str,
                            wrapper_fn, opset: int, static: bool, fp32_only: bool,
                            skip_split: bool, skip_verify: bool,
                            img_np: np.ndarray) -> list[dict]:
-    """Export a TripoSR variant (vanilla or ToMe) through the full pipeline."""
+    """Export a TripoSR variant (vanilla or ToMe) through the full pipeline.
+
+    Split happens BEFORE graph optimization — optimization renames internal
+    tensors which would break the split boundary lookup.
+    """
     results = []
     _print_section(f"TRIPOSR: {label}")
 
@@ -659,15 +689,18 @@ def export_triposr_variant(model: TSR, out_dir: Path, prefix: str, label: str,
                                   static=static)
     ref_np = ref_out.numpy()
 
-    optimize_graph(fp32_path)
-
-    if not skip_verify:
-        results.append(verify_onnx(fp32_path, img_np, ref_np, "image", f"{label} FP32"))
-
     if not skip_split:
+        # Split from the unoptimized graph (tensor names intact)
         p1_fp32, p2_fp32 = split_model(fp32_path, out_dir, prefix)
 
+        # Now optimize the full model (for benchmarking) and split parts separately
+        optimize_graph(fp32_path)
+        optimize_graph(p1_fp32)
+        optimize_graph(p2_fp32)
+
         if not skip_verify:
+            results.append(verify_onnx(fp32_path, img_np, ref_np, "image",
+                                       f"{label} FP32"))
             results.append(verify_split(p1_fp32, p2_fp32, ref_np, img_np,
                                         f"{label} Split FP32"))
 
@@ -677,14 +710,20 @@ def export_triposr_variant(model: TSR, out_dir: Path, prefix: str, label: str,
                 for prec, (p1, p2) in quant_paths.items():
                     results.append(verify_split(
                         p1, p2, ref_np, img_np, f"{label} Split {prec.upper()}"))
+    else:
+        optimize_graph(fp32_path)
 
-    elif not fp32_only:
-        fp16_path, int8_path = quantize_all(fp32_path, label)
         if not skip_verify:
-            results.append(verify_onnx(fp16_path, img_np, ref_np, "image",
-                                       f"{label} FP16"))
-            results.append(verify_onnx(int8_path, img_np, ref_np, "image",
-                                       f"{label} INT8"))
+            results.append(verify_onnx(fp32_path, img_np, ref_np, "image",
+                                       f"{label} FP32"))
+
+        if not fp32_only:
+            fp16_path, int8_path = quantize_all(fp32_path, label)
+            if not skip_verify:
+                results.append(verify_onnx(fp16_path, img_np, ref_np, "image",
+                                           f"{label} FP16"))
+                results.append(verify_onnx(int8_path, img_np, ref_np, "image",
+                                           f"{label} INT8"))
 
     return results
 
