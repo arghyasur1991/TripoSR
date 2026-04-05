@@ -917,27 +917,50 @@ def benchmark_onnx(model_path: Path, n_runs: int = 10) -> float:
 # Deploy
 # ===========================================================================
 
-def deploy_to_unity(models_dir: Path, precision: str = "int8"):
+def deploy_to_unity(models_dir: Path, precision: str = "all"):
     """Copy deployment models to Unity OnnxSource directory.
 
-    Copies split TripoSR parts, nerf decoder, and u2netp.
-    Renames parts to triposr_part1.onnx / triposr_part2.onnx for the Unity pipeline.
+    When precision="all", copies all available variants with precision suffixes
+    (e.g. triposr_part1_fp32.onnx, triposr_part1_int8.onnx). The Unity wizard
+    then picks the desired precision at deploy time.
+
+    When a specific precision is given, copies only that variant with generic
+    names (for direct use without the wizard).
+
+    u2netp always uses FP32 (FP16 is broken due to Resize op, INT8 is same size).
     """
     _print_section(f"DEPLOYING ({precision.upper()}) TO UNITY")
 
     if not UNITY_ONNX_SOURCE.exists():
-        log(f"  ERROR: Unity OnnxSource not found: {UNITY_ONNX_SOURCE}")
-        return
+        UNITY_ONNX_SOURCE.mkdir(parents=True, exist_ok=True)
+        log(f"  Created {UNITY_ONNX_SOURCE}")
 
-    decoder_name = "nerf_decoder.onnx" if precision == "fp32" else f"nerf_decoder_{precision}.onnx"
-    u2netp_name = "u2netp.onnx" if precision == "fp32" else f"u2netp_{precision}.onnx"
+    if precision == "all":
+        copies = []
+        for prec in ["fp32", "fp16", "int8"]:
+            for part in ["triposr_part1", "triposr_part2"]:
+                src = models_dir / f"{part}_{prec}.onnx"
+                if src.exists():
+                    copies.append((src, f"{part}_{prec}.onnx"))
 
-    copies = [
-        (models_dir / f"triposr_part1_{precision}.onnx", "triposr_part1.onnx"),
-        (models_dir / f"triposr_part2_{precision}.onnx", "triposr_part2.onnx"),
-        (models_dir / decoder_name, "nerf_decoder.onnx"),
-        (models_dir / u2netp_name, "u2netp.onnx"),
-    ]
+            dec_name = "nerf_decoder.onnx" if prec == "fp32" else f"nerf_decoder_{prec}.onnx"
+            dec_src = models_dir / dec_name
+            if dec_src.exists():
+                dst_name = f"nerf_decoder_{prec}.onnx" if prec != "fp32" else "nerf_decoder_fp32.onnx"
+                copies.append((dec_src, dst_name))
+
+        # u2netp FP32 only (FP16 broken, INT8 same size)
+        u2netp_src = models_dir / "u2netp.onnx"
+        if u2netp_src.exists():
+            copies.append((u2netp_src, "u2netp.onnx"))
+    else:
+        dec_name = "nerf_decoder.onnx" if precision == "fp32" else f"nerf_decoder_{precision}.onnx"
+        copies = [
+            (models_dir / f"triposr_part1_{precision}.onnx", "triposr_part1.onnx"),
+            (models_dir / f"triposr_part2_{precision}.onnx", "triposr_part2.onnx"),
+            (models_dir / dec_name, "nerf_decoder.onnx"),
+            (models_dir / "u2netp.onnx", "u2netp.onnx"),
+        ]
 
     for src, dst_name in copies:
         dst = UNITY_ONNX_SOURCE / dst_name
