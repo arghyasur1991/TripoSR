@@ -349,23 +349,26 @@ def transformer_optimize(input_path: Path, output_path: Path = None,
     log(f"    {ops_after} ops (was {ops_before}, -{ops_before - ops_after}) [{time.time()-t0:.1f}s]")
 
 
-def optimize_graph(input_path: Path, output_path: Path = None):
-    """Apply ORT graph optimizations (opt_level=ALL).
+def optimize_graph(input_path: Path, output_path: Path = None, level: str = "all"):
+    """Apply ORT graph optimizations.
 
-    Uses ORT_ENABLE_ALL to fuse attention, LayerNorm, GELU, and MatMul+Add
-    patterns before quantization. Previously used ORT_ENABLE_BASIC for Sentis
-    compatibility, but we now use ORT runtime exclusively.
+    level="all" (default): ORT_ENABLE_ALL — fuses MatMul+Add → Gemm, etc.
+    level="basic": ORT_ENABLE_BASIC — constant folding, dead node elimination only.
+      Use for small models (decoder) where Gemm fusion breaks dynamic INT8 quantization.
     """
     import onnxruntime as ort
 
     if output_path is None:
         output_path = input_path
 
-    log(f"  Optimizing graph (ALL): {input_path.name}")
+    opt_level = (ort.GraphOptimizationLevel.ORT_ENABLE_ALL if level == "all"
+                 else ort.GraphOptimizationLevel.ORT_ENABLE_BASIC)
+
+    log(f"  Optimizing graph ({level.upper()}): {input_path.name}")
     t0 = time.time()
 
     so = ort.SessionOptions()
-    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    so.graph_optimization_level = opt_level
     so.optimized_model_filepath = str(output_path)
     ort.InferenceSession(str(input_path), so, providers=["CPUExecutionProvider"])
 
@@ -1100,7 +1103,7 @@ def export_decoder(model: TSR, output_dir: Path, opset: int = 15,
         dynamo=False,
     )
 
-    optimize_graph(fp32_path)
+    optimize_graph(fp32_path, level="basic")
     log(f"  Decoder FP32: {fp32_path.stat().st_size / 1e6:.3f}MB")
 
     ref_np = ref_out.numpy()
