@@ -1,10 +1,11 @@
 """Background removal wrapper using rembg (u2netp model).
 
+For ONNX model export (u2netp, TripoSR, decoder), use export_onnx.py instead.
+
 Usage:
     python remove_bg.py                          # process all *_raw.* in test_images/novel/
     python remove_bg.py --input path/to/img.jpg  # single image
     python remove_bg.py --input-dir path/to/dir  # all images in directory
-    python remove_bg.py --export-model            # export u2netp ONNX to models/
 """
 
 import argparse
@@ -54,88 +55,13 @@ def process_directory(input_dir: Path, session=None):
         print(" done")
 
 
-def export_u2netp_onnx(output_dir: Path, target_opset: int = 15):
-    """Export the u2netp ONNX model file for on-device deployment.
-
-    Converts the rembg-bundled model to the target opset for Sentis compatibility,
-    then applies graph optimization (constant folding, dead-node elimination).
-    """
-    import shutil
-    import onnx
-    from onnx import version_converter
-    from rembg.sessions import U2netpSession
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    src = Path(U2netpSession.download_models())
-    raw_dst = output_dir / "u2netp_raw.onnx"
-    dst = output_dir / "u2netp.onnx"
-
-    shutil.copy2(src, raw_dst)
-    print(f"Copied raw u2netp to {raw_dst} ({raw_dst.stat().st_size / 1e6:.1f} MB)")
-
-    model = onnx.load(str(raw_dst))
-    orig_opset = model.opset_import[0].version
-    orig_nodes = len(model.graph.node)
-    print(f"Original: opset {orig_opset}, {orig_nodes} nodes")
-
-    if orig_opset != target_opset:
-        print(f"Converting opset {orig_opset} -> {target_opset}...")
-        model = version_converter.convert_version(model, target_opset)
-        onnx.checker.check_model(model)
-        print(f"After opset conversion: {len(model.graph.node)} nodes")
-
-    try:
-        import onnxruntime as ort
-
-        tmp_path = str(output_dir / "u2netp_tmp.onnx")
-        onnx.save(model, tmp_path)
-
-        opts = ort.SessionOptions()
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
-        opts.optimized_model_filepath = str(dst)
-        _ = ort.InferenceSession(tmp_path, opts, providers=["CPUExecutionProvider"])
-        Path(tmp_path).unlink(missing_ok=True)
-
-        opt_model = onnx.load(str(dst))
-        opt_nodes = len(opt_model.graph.node)
-        print(f"After graph optimization: {opt_nodes} nodes (was {orig_nodes}, -{(1 - opt_nodes / orig_nodes) * 100:.0f}%)")
-    except ImportError:
-        print("onnxruntime not available, skipping graph optimization")
-        onnx.save(model, str(dst))
-
-    raw_dst.unlink(missing_ok=True)
-    print(f"Final u2netp saved to {dst} ({dst.stat().st_size / 1e6:.1f} MB)")
-
-    _verify_u2netp(dst)
-
-
-def _verify_u2netp(model_path: Path):
-    """Quick sanity check: run a dummy input through the exported model."""
-    import numpy as np
-    import onnxruntime as ort
-
-    print("Verifying u2netp output...")
-    sess = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
-    dummy = np.random.rand(1, 3, 320, 320).astype(np.float32)
-    outputs = sess.run(None, {sess.get_inputs()[0].name: dummy})
-    print(f"  Input: {dummy.shape}")
-    for i, o in enumerate(outputs):
-        print(f"  Output[{i}]: shape={o.shape}, range=[{o.min():.3f}, {o.max():.3f}]")
-    print("  Verification PASSED")
-
-
 def main():
     parser = argparse.ArgumentParser(description="Background removal using rembg u2netp")
     parser.add_argument("--input", type=Path, help="Single image to process")
     parser.add_argument("--input-dir", type=Path, help="Directory of images to process")
     parser.add_argument("--output", type=Path, help="Output path (for single image mode)")
     parser.add_argument("--model", default="u2netp", help="rembg model name (default: u2netp)")
-    parser.add_argument("--export-model", action="store_true", help="Export ONNX model to models/")
     args = parser.parse_args()
-
-    if args.export_model:
-        export_u2netp_onnx(Path(__file__).parent / "models")
-        return
 
     print(f"Loading rembg session (model={args.model})...")
     session = new_session(args.model)
