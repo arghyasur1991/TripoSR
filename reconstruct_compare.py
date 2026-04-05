@@ -182,6 +182,7 @@ def run_e2e_onnx_inference(
     model: TSR,
     image_path: Path,
     device: str,
+    coarse_to_fine: bool = False,
 ) -> trimesh.Trimesh:
     """Full end-to-end: rembg ONNX → TripoSR ONNX (full) → decoder ONNX → mesh."""
     img_np = _preprocess_for_onnx_with_rembg(rembg_session, image_path)
@@ -190,7 +191,8 @@ def run_e2e_onnx_inference(
         img_np = img_np.astype(np.float16)
     scene_codes_np = onnx_session.run(None, {"image": img_np})[0].astype(np.float32)
     scene_codes = torch.from_numpy(scene_codes_np).to(device)
-    return _extract_mesh_onnx_decoder(model, scene_codes, decoder_session, device)
+    return _extract_mesh_onnx_decoder(model, scene_codes, decoder_session, device,
+                                      coarse_to_fine=coarse_to_fine)
 
 
 def _run_split_forward(part1_session, part2_session, img_np: np.ndarray) -> np.ndarray:
@@ -219,12 +221,14 @@ def run_e2e_split_onnx_inference(
     model: TSR,
     image_path: Path,
     device: str,
+    coarse_to_fine: bool = False,
 ) -> trimesh.Trimesh:
     """Full end-to-end: rembg ONNX → TripoSR split (part1+part2) → decoder ONNX → mesh."""
     img_np = _preprocess_for_onnx_with_rembg(rembg_session, image_path)
     scene_codes_np = _run_split_forward(part1_session, part2_session, img_np)
     scene_codes = torch.from_numpy(scene_codes_np).to(device)
-    return _extract_mesh_onnx_decoder(model, scene_codes, decoder_session, device)
+    return _extract_mesh_onnx_decoder(model, scene_codes, decoder_session, device,
+                                      coarse_to_fine=coarse_to_fine)
 
 
 def run_onnx_inference(
@@ -233,6 +237,7 @@ def run_onnx_inference(
     image_path: Path,
     device: str,
     decoder_session=None,
+    coarse_to_fine: bool = False,
 ) -> trimesh.Trimesh:
     """Run ONNX forward pass for scene_codes, then mesh extraction.
 
@@ -243,7 +248,8 @@ def run_onnx_inference(
     scene_codes = torch.from_numpy(scene_codes_np).to(device)
 
     if decoder_session is not None:
-        return _extract_mesh_onnx_decoder(model, scene_codes, decoder_session, device)
+        return _extract_mesh_onnx_decoder(model, scene_codes, decoder_session, device,
+                                          coarse_to_fine=coarse_to_fine)
 
     with torch.no_grad():
         model.set_marching_cubes_resolution(256)
@@ -258,11 +264,16 @@ def _extract_mesh_onnx_decoder(
     device: str,
     resolution: int = 256,
     threshold: float = 25.0,
+    coarse_to_fine: bool = False,
 ) -> trimesh.Trimesh:
     """Extract mesh using ONNX decoder instead of PyTorch decoder.
 
     Replicates TSR.extract_mesh but swaps the decoder MLP call with ONNX inference.
     The triplane grid_sample and marching cubes stay in PyTorch/CPU.
+
+    If coarse_to_fine=True, uses a two-pass strategy: coarse (res/4) pass to identify
+    occupied regions, then fine pass only within occupied cells. Matches the C#
+    CpuMeshExtractor coarse-to-fine implementation for quality comparison.
     """
     import torch.nn.functional as F
     from einops import rearrange
@@ -297,7 +308,7 @@ def _extract_mesh_onnx_decoder(
 
         # ONNX decoder: (N, 120) -> (N, 4) = [density, r, g, b]
         feat_np = features.cpu().numpy()
-        chunk_size = 65536
+        chunk_size = 131072
         results = []
         for i in range(0, feat_np.shape[0], chunk_size):
             chunk = feat_np[i:i+chunk_size]
@@ -320,14 +331,125 @@ def _extract_mesh_onnx_decoder(
             "color": color.view(*input_shape, -1),
         }
 
-    with torch.no_grad():
-        grid_verts = scale_tensor(
-            helper.grid_vertices.to(device),
-            helper.points_range,
-            (-renderer.cfg.radius, renderer.cfg.radius),
+    def _query_density_only(positions, triplane):
+        """Query only density (no color) for the coarse pass."""
+        import torch.nn.functional as F
+        from einops import rearrange
+        from tsr.utils import scale_tensor, get_activation
+
+        positions = positions.view(-1, 3)
+        positions = scale_tensor(
+            positions, (-renderer.cfg.radius, renderer.cfg.radius), (-1, 1)
         )
-        density_result = query_triplane_onnx(grid_verts, scene_code)
-        density = density_result["density_act"]
+
+        indices2D = torch.stack(
+            (positions[..., [0, 1]], positions[..., [0, 2]], positions[..., [1, 2]]),
+            dim=-3,
+        )
+        out = F.grid_sample(
+            rearrange(triplane, "Np Cp Hp Wp -> Np Cp Hp Wp", Np=3),
+            rearrange(indices2D, "Np N Nd -> Np () N Nd", Np=3),
+            align_corners=False,
+            mode="bilinear",
+        )
+        features = rearrange(out, "Np Cp () N -> N (Np Cp)", Np=3)
+
+        feat_np = features.cpu().numpy()
+        chunk_size = 131072
+        results = []
+        for i in range(0, feat_np.shape[0], chunk_size):
+            chunk = feat_np[i:i+chunk_size]
+            result = decoder_session.run(None, {"triplane_features": chunk})[0]
+            results.append(result)
+        raw = np.concatenate(results, axis=0)
+        raw_t = torch.from_numpy(raw).to(device)
+
+        density = raw_t[..., 0:1]
+        density_act = get_activation(renderer.cfg.density_activation)(
+            density + renderer.cfg.density_bias
+        )
+        return density_act
+
+    if coarse_to_fine:
+        coarse_res = max(resolution // 4, 16)
+        fine_ratio = resolution // coarse_res
+        t0 = time.perf_counter()
+
+        # Coarse pass: build low-res grid matching helper's indexing="ij" (x-major)
+        coords_1d = torch.linspace(-0.5, 0.5, coarse_res, device=device)
+        grid_x, grid_y, grid_z = torch.meshgrid(coords_1d, coords_1d, coords_1d, indexing="ij")
+        coarse_grid = torch.stack([grid_x, grid_y, grid_z], dim=-1).reshape(-1, 3)
+
+        with torch.no_grad():
+            coarse_density = _query_density_only(coarse_grid, scene_code)
+        # x-major layout: dim0=x, dim1=y, dim2=z
+        coarse_density = coarse_density.reshape(coarse_res, coarse_res, coarse_res)
+
+        raw_mask = coarse_density >= threshold
+        from scipy.ndimage import binary_dilation
+        dilated = binary_dilation(raw_mask.cpu().numpy(), iterations=1)
+        occupied = torch.from_numpy(dilated)
+
+        occupied_count = int(occupied.sum())
+        total_coarse = coarse_res ** 3
+        print(f"    coarse {coarse_res}^3: {occupied_count}/{total_coarse} occupied "
+              f"({100.0 * occupied_count / total_coarse:.1f}%), fine ratio {fine_ratio}x")
+
+        # Fine pass: build points within occupied coarse cells (x-major flat indexing)
+        fine_indices = []
+        fine_positions = []
+        fine_inv = 1.0 / (resolution - 1)
+        for cx in range(coarse_res):
+            for cy in range(coarse_res):
+                for cz in range(coarse_res):
+                    if not occupied[cx, cy, cz]:
+                        continue
+                    fxs = cx * fine_ratio
+                    fys = cy * fine_ratio
+                    fzs = cz * fine_ratio
+                    fxe = min(fxs + fine_ratio, resolution)
+                    fye = min(fys + fine_ratio, resolution)
+                    fze = min(fzs + fine_ratio, resolution)
+                    for fx in range(fxs, fxe):
+                        for fy in range(fys, fye):
+                            for fz in range(fzs, fze):
+                                flat = fx * resolution * resolution + fy * resolution + fz
+                                fine_indices.append(flat)
+                                fine_positions.append([
+                                    fx * fine_inv - 0.5,
+                                    fy * fine_inv - 0.5,
+                                    fz * fine_inv - 0.5,
+                                ])
+
+        fine_count = len(fine_indices)
+        total_fine = resolution ** 3
+        print(f"    fine pass: {fine_count}/{total_fine} points "
+              f"({100.0 * fine_count / total_fine:.1f}%)")
+
+        fine_positions_t = torch.tensor(fine_positions, dtype=torch.float32, device=device)
+
+        with torch.no_grad():
+            fine_density = _query_density_only(fine_positions_t, scene_code)
+
+        # Scatter into full-res density volume (unsampled cells stay 0 = below threshold)
+        density_full = torch.zeros(total_fine, 1, device=device)
+        fine_indices_t = torch.tensor(fine_indices, dtype=torch.long, device=device)
+        density_full[fine_indices_t] = fine_density.view(-1, 1)
+        density = density_full.reshape(resolution, resolution, resolution)
+
+        t_density = time.perf_counter() - t0
+        print(f"    coarse-to-fine density: {t_density:.1f}s "
+              f"(decoder calls: {fine_count} vs {total_fine} full)")
+
+    else:
+        with torch.no_grad():
+            grid_verts = scale_tensor(
+                helper.grid_vertices.to(device),
+                helper.points_range,
+                (-renderer.cfg.radius, renderer.cfg.radius),
+            )
+            density_result = query_triplane_onnx(grid_verts, scene_code)
+            density = density_result["density_act"]
 
     above = int((density > threshold).sum())
     print(f"    density_act: min={density.min():.2f} max={density.max():.2f} "
@@ -633,7 +755,8 @@ def run_onnx_variant(
         baseline_mesh = trimesh.load(str(baseline_path), process=False)
 
         variant_mesh = run_onnx_inference(
-            session, model, img_path, device, decoder_session=decoder_session
+            session, model, img_path, device, decoder_session=decoder_session,
+            coarse_to_fine=args.coarse_to_fine
         )
         metrics = compute_metrics(baseline_mesh, variant_mesh)
 
@@ -698,6 +821,8 @@ def main():
                         help="Specific images for --e2e (default: Unity test set)")
     parser.add_argument("--e2e-variant", nargs="*", type=str,
                         help="Filter e2e variants by substring, e.g. 'int8' or 'fp32 int8'")
+    parser.add_argument("--coarse-to-fine", action="store_true",
+                        help="Use coarse-to-fine mesh extraction (matches C# CpuMeshExtractor)")
     parser.add_argument("--device", default="auto", help="Device: auto, cpu, mps, cuda")
     parser.add_argument("--no-latency", action="store_true", help="Skip latency measurement")
     args = parser.parse_args()
@@ -928,11 +1053,13 @@ def main():
                             if is_split:
                                 e2e_mesh = run_e2e_split_onnx_inference(
                                     rembg_sess, p1_sess, p2_sess, decoder_sess,
-                                    model, img_path, device)
+                                    model, img_path, device,
+                                    coarse_to_fine=args.coarse_to_fine)
                             else:
                                 e2e_mesh = run_e2e_onnx_inference(
                                     rembg_sess, full_sess, decoder_sess,
-                                    model, img_path, device)
+                                    model, img_path, device,
+                                    coarse_to_fine=args.coarse_to_fine)
                         except (ValueError, RuntimeError) as e:
                             elapsed = time.perf_counter() - t0
                             print(f" CRASH ({e}) {elapsed:.1f}s")

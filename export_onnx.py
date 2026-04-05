@@ -517,15 +517,26 @@ def _collect_calibration_images(n: int = 8) -> list[np.ndarray]:
 
 
 def _collect_rembg_calibration_images(n: int = 8) -> list[np.ndarray]:
-    """Collect preprocessed calibration images for u2netp (1, 3, 320, 320)."""
+    """Collect preprocessed calibration images for u2netp (1, 3, 320, 320).
+
+    Only uses raw images (with backgrounds) since that's what u2netp
+    processes in production. Excludes *_nobg.png and pre-segmented RGBA PNGs.
+    """
     test_dir = Path(__file__).parent / "test_images"
-    paths = []
-    for subdir in ["examples", "novel"]:
-        d = test_dir / subdir
-        if not d.exists():
-            continue
-        for ext in ("*.png", "*.jpg"):
-            paths.extend(sorted(d.glob(ext)))
+    raw_paths = sorted((test_dir / "novel").glob("*_raw.*")) if (test_dir / "novel").exists() else []
+    paths = raw_paths[:n]
+    if len(paths) < n:
+        for subdir in ["examples", "novel"]:
+            d = test_dir / subdir
+            if not d.exists():
+                continue
+            for p in sorted(d.glob("*.jpg")):
+                if p not in paths:
+                    paths.append(p)
+                if len(paths) >= n:
+                    break
+            if len(paths) >= n:
+                break
     paths = paths[:n]
 
     mean = np.array([0.485, 0.456, 0.406])
