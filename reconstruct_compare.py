@@ -687,6 +687,8 @@ def main():
                         help="Full rembg+triposr+decoder ONNX pipeline on Unity test images (raw + RGBA)")
     parser.add_argument("--e2e-images", nargs="*", type=Path,
                         help="Specific images for --e2e (default: Unity test set)")
+    parser.add_argument("--e2e-variant", nargs="*", type=str,
+                        help="Filter e2e variants by substring, e.g. 'int8' or 'fp32 int8'")
     parser.add_argument("--device", default="auto", help="Device: auto, cpu, mps, cuda")
     parser.add_argument("--no-latency", action="store_true", help="Skip latency measurement")
     args = parser.parse_args()
@@ -854,10 +856,22 @@ def main():
                 if all(p.exists() for p in [p1_int8, p2_int8, dec_int8]):
                     e2e_variants.append(("e2e_split_int8", rembg_path, p1_int8, p2_int8, dec_int8))
 
+                # INT8-QDQ split pipeline (static quantization for NPU/QNN HTP)
+                p1_qdq = models_dir / "triposr_part1_int8_qdq.onnx"
+                p2_qdq = models_dir / "triposr_part2_int8_qdq.onnx"
+                dec_qdq = models_dir / "nerf_decoder_int8_qdq.onnx"
+                if all(p.exists() for p in [p1_qdq, p2_qdq, dec_qdq]):
+                    e2e_variants.append(("e2e_split_int8_qdq", rembg_path, p1_qdq, p2_qdq, dec_qdq))
+
                 # Full (unsplit) FP32 for reference
                 triposr_full = models_dir / "triposr_fp32.onnx"
                 if all(p.exists() for p in [triposr_full, dec_fp32]):
                     e2e_variants.append(("e2e_full_fp32", rembg_path, triposr_full, None, dec_fp32))
+
+            if args.e2e_variant:
+                filters = [f.lower() for f in args.e2e_variant]
+                e2e_variants = [v for v in e2e_variants
+                                if any(f in v[0].lower() for f in filters)]
 
             if not e2e_variants:
                 print("No complete e2e model sets found! Run export_onnx.py first.")
@@ -897,14 +911,29 @@ def main():
                         baseline_mesh = trimesh.load(str(baseline_cache), process=False)
 
                         t0 = time.perf_counter()
-                        if is_split:
-                            e2e_mesh = run_e2e_split_onnx_inference(
-                                rembg_sess, p1_sess, p2_sess, decoder_sess,
-                                model, img_path, device)
-                        else:
-                            e2e_mesh = run_e2e_onnx_inference(
-                                rembg_sess, full_sess, decoder_sess,
-                                model, img_path, device)
+                        try:
+                            if is_split:
+                                e2e_mesh = run_e2e_split_onnx_inference(
+                                    rembg_sess, p1_sess, p2_sess, decoder_sess,
+                                    model, img_path, device)
+                            else:
+                                e2e_mesh = run_e2e_onnx_inference(
+                                    rembg_sess, full_sess, decoder_sess,
+                                    model, img_path, device)
+                        except (ValueError, RuntimeError) as e:
+                            elapsed = time.perf_counter() - t0
+                            print(f" CRASH ({e}) {elapsed:.1f}s")
+                            result = {
+                                "image": rel,
+                                "metrics": {
+                                    "cd_pct": 100.0, "f_score_1pct": 0.0,
+                                    "f_score_2pct": 0.0, "volume_iou": 0.0,
+                                    "verts_ratio": 0.0,
+                                },
+                                "latency": elapsed,
+                            }
+                            results.append(result)
+                            continue
                         elapsed = time.perf_counter() - t0
 
                         metrics = compute_metrics(baseline_mesh, e2e_mesh)

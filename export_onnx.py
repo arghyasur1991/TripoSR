@@ -17,23 +17,29 @@ the original 'image' input — splitting after quantization leaves Part 2 with
 a dangling reference.
 
 Output structure (in models/):
-  u2netp.onnx                 Background removal (FP32)
-  u2netp_fp16.onnx            Background removal (FP16)
-  u2netp_int8.onnx            Background removal (INT8)
-  triposr_fp32.onnx           Full TripoSR (reference/benchmarking)
-  triposr_part1_fp32.onnx     Split encoder half
-  triposr_part2_fp32.onnx     Split decoder half
-  triposr_part1_fp16.onnx     Split encoder half (FP16)
-  triposr_part2_fp16.onnx     Split decoder half (FP16)
-  triposr_part1_int8.onnx     Split encoder half (INT8)
-  triposr_part2_int8.onnx     Split decoder half (INT8)
-  nerf_decoder.onnx           NeRF MLP decoder (FP32)
-  nerf_decoder_fp16.onnx      NeRF MLP decoder (FP16)
-  nerf_decoder_int8.onnx      NeRF MLP decoder (INT8)
+  u2netp.onnx                     Background removal (FP32)
+  u2netp_fp16.onnx                Background removal (FP16)
+  u2netp_int8.onnx                Background removal (INT8 dynamic)
+  u2netp_int8_qdq.onnx            Background removal (INT8 QDQ static, for NPU)
+  triposr_fp32.onnx               Full TripoSR (reference/benchmarking)
+  triposr_part1_fp32.onnx         Split encoder half
+  triposr_part2_fp32.onnx         Split decoder half
+  triposr_part1_fp16.onnx         Split encoder half (FP16)
+  triposr_part2_fp16.onnx         Split decoder half (FP16)
+  triposr_part1_int8.onnx         Split encoder half (INT8 dynamic)
+  triposr_part2_int8.onnx         Split decoder half (INT8 dynamic)
+  triposr_part1_int8_qdq.onnx     Split encoder half (INT8 QDQ static, for NPU)
+  triposr_part2_int8_qdq.onnx     Split decoder half (INT8 QDQ static, for NPU)
+  nerf_decoder.onnx               NeRF MLP decoder (FP32)
+  nerf_decoder_fp16.onnx          NeRF MLP decoder (FP16)
+  nerf_decoder_int8.onnx          NeRF MLP decoder (INT8 dynamic)
+  nerf_decoder_int8_qdq.onnx      NeRF MLP decoder (INT8 QDQ static, for NPU)
 
 Usage:
     python export_onnx.py                       # Full pipeline (recommended)
     python export_onnx.py --fp32-only           # FP32 + split only
+    python export_onnx.py --qdq-only            # QDQ INT8 from existing FP32 models
+    python export_onnx.py --qdq                 # Full pipeline + QDQ INT8
     python export_onnx.py --skip-rembg          # Skip u2netp export
     python export_onnx.py --skip-split          # Full triposr only, no split
     python export_onnx.py --benchmark           # Export + benchmark
@@ -384,6 +390,7 @@ def validate_all_models(models_dir: Path) -> bool:
         ("u2netp.onnx", None),
         ("u2netp_fp16.onnx", None),
         ("u2netp_int8.onnx", None),
+        ("u2netp_int8_qdq.onnx", None),
         ("triposr_fp32.onnx", None),
         ("triposr_part1_fp32.onnx", None),
         ("triposr_part2_fp32.onnx", None),
@@ -391,9 +398,12 @@ def validate_all_models(models_dir: Path) -> bool:
         ("triposr_part2_fp16.onnx", None),
         ("triposr_part1_int8.onnx", None),
         ("triposr_part2_int8.onnx", None),
+        ("triposr_part1_int8_qdq.onnx", None),
+        ("triposr_part2_int8_qdq.onnx", None),
         ("nerf_decoder.onnx", decoder_dynamic),
         ("nerf_decoder_fp16.onnx", decoder_dynamic),
         ("nerf_decoder_int8.onnx", decoder_dynamic),
+        ("nerf_decoder_int8_qdq.onnx", decoder_dynamic),
     ]
 
     for filename, allowed in checks:
@@ -453,7 +463,160 @@ def quantize_int8(input_path: Path, output_path: Path):
         f"{fsize/fp32_size*100:.0f}%)")
 
 
-def quantize_all(fp32_path: Path, name: str):
+class _NumpyCalibrationReader:
+    """Feeds pre-computed numpy arrays to onnxruntime static quantization."""
+
+    def __init__(self, input_name: str, data_list: list[np.ndarray]):
+        self.input_name = input_name
+        self.data_list = data_list
+        self.index = 0
+
+    def get_next(self):
+        if self.index >= len(self.data_list):
+            return None
+        sample = {self.input_name: self.data_list[self.index]}
+        self.index += 1
+        return sample
+
+
+class _MultiInputCalibrationReader:
+    """Feeds multi-input samples (dict per sample) to static quantization."""
+
+    def __init__(self, samples: list[dict[str, np.ndarray]]):
+        self.samples = samples
+        self.index = 0
+
+    def get_next(self):
+        if self.index >= len(self.samples):
+            return None
+        sample = self.samples[self.index]
+        self.index += 1
+        return sample
+
+
+def _collect_calibration_images(n: int = 8) -> list[np.ndarray]:
+    """Collect preprocessed calibration images for TripoSR (1, 3, 512, 512)."""
+    test_dir = Path(__file__).parent / "test_images"
+    paths = []
+    for subdir in ["examples", "novel"]:
+        d = test_dir / subdir
+        if not d.exists():
+            continue
+        for ext in ("*.png", "*.jpg"):
+            paths.extend(sorted(d.glob(ext)))
+    paths = paths[:n]
+
+    processor = ImagePreprocessor()
+    images = []
+    for p in paths:
+        img = prepare_image(p)
+        rgb = processor(img, 512)
+        images.append(rgb.permute(0, 3, 1, 2).numpy())
+    log(f"    Collected {len(images)} calibration images")
+    return images
+
+
+def _collect_rembg_calibration_images(n: int = 8) -> list[np.ndarray]:
+    """Collect preprocessed calibration images for u2netp (1, 3, 320, 320)."""
+    test_dir = Path(__file__).parent / "test_images"
+    paths = []
+    for subdir in ["examples", "novel"]:
+        d = test_dir / subdir
+        if not d.exists():
+            continue
+        for ext in ("*.png", "*.jpg"):
+            paths.extend(sorted(d.glob(ext)))
+    paths = paths[:n]
+
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+
+    images = []
+    for p in paths:
+        from PIL import Image as PILImage
+        img = PILImage.open(p).convert("RGB")
+        resized = img.resize((320, 320), PILImage.LANCZOS)
+        arr = np.array(resized, dtype=np.float32)
+        arr = arr / max(np.max(arr), 1e-6)
+        tmp = np.zeros((320, 320, 3), dtype=np.float32)
+        tmp[:, :, 0] = (arr[:, :, 0] - mean[0]) / std[0]
+        tmp[:, :, 1] = (arr[:, :, 1] - mean[1]) / std[1]
+        tmp[:, :, 2] = (arr[:, :, 2] - mean[2]) / std[2]
+        images.append(tmp.transpose(2, 0, 1)[np.newaxis])
+    log(f"    Collected {len(images)} rembg calibration images")
+    return images
+
+
+def quantize_int8_qdq(input_path: Path, output_path: Path,
+                      calibration_data: list[np.ndarray] | list[dict[str, np.ndarray]],
+                      input_name: str | None = None):
+    """Apply QNN-optimized static quantization in QDQ format for Hexagon HTP.
+
+    Uses the ORT QNN-specific pipeline:
+    1. qnn_preprocess_model -- fuses LayerNorm, fixes op patterns for QNN
+    2. get_qnn_qdq_config -- generates QNN-optimized quantization config
+       with uint16 activations (65k levels) for transformer accuracy
+    3. quantize() -- unified entry point
+
+    uint16 activations + uint8 weights is the Qualcomm-recommended config
+    for accuracy-sensitive models (transformers, ViTs).
+    """
+    import onnxruntime as ort
+    from onnxruntime.quantization import QuantType, quantize
+    from onnxruntime.quantization.execution_providers.qnn import (
+        get_qnn_qdq_config, qnn_preprocess_model,
+    )
+
+    log(f"  QNN-QDQ: {output_path.name} ({len(calibration_data)} cal samples)")
+    t0 = time.time()
+
+    # Step 1: QNN-specific preprocessing (fuse LayerNorm, fix op patterns)
+    preprocessed = output_path.parent / f"_qnn_preproc_{output_path.name}"
+    try:
+        model_changed = qnn_preprocess_model(str(input_path), str(preprocessed))
+        if model_changed and preprocessed.exists():
+            log(f"    QNN preprocess: modified graph")
+            quant_input = preprocessed
+        else:
+            log(f"    QNN preprocess: no changes needed")
+            quant_input = input_path
+    except Exception as e:
+        log(f"    QNN preprocess failed ({e}), using original model")
+        quant_input = input_path
+
+    # Build calibration reader
+    if isinstance(calibration_data[0], dict):
+        reader = _MultiInputCalibrationReader(calibration_data)
+    else:
+        if input_name is None:
+            sess = ort.InferenceSession(str(quant_input), providers=["CPUExecutionProvider"])
+            input_name = sess.get_inputs()[0].name
+            del sess
+        reader = _NumpyCalibrationReader(input_name, calibration_data)
+
+    # Step 2: QNN-optimized config (uint16 activations for transformer accuracy)
+    qnn_config = get_qnn_qdq_config(
+        str(quant_input),
+        reader,
+        activation_type=QuantType.QUInt16,
+        weight_type=QuantType.QUInt8,
+        per_channel=True,
+    )
+
+    # Step 3: Quantize with unified entry point
+    quantize(str(quant_input), str(output_path), qnn_config)
+
+    preprocessed.unlink(missing_ok=True)
+
+    fsize = output_path.stat().st_size / 1e6
+    fp32_size = input_path.stat().st_size / 1e6
+    log(f"    {fsize:.1f}MB (was {fp32_size:.1f}MB, "
+        f"{fsize/fp32_size*100:.0f}%) [{time.time()-t0:.1f}s]")
+
+
+def quantize_all(fp32_path: Path, name: str, qdq: bool = False,
+                  calibration_data: list[np.ndarray] | None = None,
+                  input_name: str | None = None):
     """Generate FP16 and INT8 variants from a FP32 model."""
     stem = fp32_path.stem.replace("_fp32", "").replace(".onnx", "")
     parent = fp32_path.parent
@@ -463,7 +626,13 @@ def quantize_all(fp32_path: Path, name: str):
     log(f"\n  Quantizing {name}...")
     convert_fp16(fp32_path, fp16_path)
     quantize_int8(fp32_path, int8_path)
-    return fp16_path, int8_path
+
+    int8_qdq_path = None
+    if qdq and calibration_data:
+        int8_qdq_path = parent / f"{stem}_int8_qdq.onnx"
+        quantize_int8_qdq(fp32_path, int8_qdq_path, calibration_data, input_name)
+
+    return fp16_path, int8_path, int8_qdq_path
 
 
 # ===========================================================================
@@ -526,7 +695,7 @@ def split_model(input_path: Path, output_dir: Path, prefix: str = "triposr"):
 
 
 def quantize_split_parts(part1_fp32: Path, part2_fp32: Path, output_dir: Path,
-                         prefix: str = "triposr"):
+                         prefix: str = "triposr", qdq: bool = False):
     """Quantize split FP32 parts to FP16 and INT8 independently."""
     p1_fp16 = output_dir / f"{prefix}_part1_fp16.onnx"
     p2_fp16 = output_dir / f"{prefix}_part2_fp16.onnx"
@@ -539,10 +708,40 @@ def quantize_split_parts(part1_fp32: Path, part2_fp32: Path, output_dir: Path,
     quantize_int8(part1_fp32, p1_int8)
     quantize_int8(part2_fp32, p2_int8)
 
-    return {
+    result = {
         "fp16": (p1_fp16, p2_fp16),
         "int8": (p1_int8, p2_int8),
     }
+
+    if qdq:
+        import onnxruntime as ort
+
+        p1_int8_qdq = output_dir / f"{prefix}_part1_int8_qdq.onnx"
+        p2_int8_qdq = output_dir / f"{prefix}_part2_int8_qdq.onnx"
+
+        cal_images = _collect_calibration_images()
+        quantize_int8_qdq(part1_fp32, p1_int8_qdq, cal_images, input_name="image")
+
+        # Part2 calibration: run part1 to collect intermediate tensors
+        log("    Generating Part 2 calibration data from Part 1 outputs...")
+        p1_sess = ort.InferenceSession(str(part1_fp32), providers=["CPUExecutionProvider"])
+        p2_sess_meta = ort.InferenceSession(str(part2_fp32), providers=["CPUExecutionProvider"])
+        p2_input_names = [inp.name for inp in p2_sess_meta.get_inputs()]
+        del p2_sess_meta
+
+        p2_cal_samples = []
+        for img_np in cal_images:
+            p1_outs = p1_sess.run(None, {"image": img_np})
+            p1_out_names = [o.name for o in p1_sess.get_outputs()]
+            sample = {name: val for name, val in zip(p1_out_names, p1_outs)
+                      if name in p2_input_names}
+            p2_cal_samples.append(sample)
+        del p1_sess
+
+        quantize_int8_qdq(part2_fp32, p2_int8_qdq, p2_cal_samples)
+        result["int8_qdq"] = (p1_int8_qdq, p2_int8_qdq)
+
+    return result
 
 
 # ===========================================================================
@@ -550,7 +749,7 @@ def quantize_split_parts(part1_fp32: Path, part2_fp32: Path, output_dir: Path,
 # ===========================================================================
 
 def export_u2netp(output_dir: Path, target_opset: int = 15, fp32_only: bool = False,
-                  skip_verify: bool = False) -> list[dict]:
+                  skip_verify: bool = False, qdq: bool = False) -> list[dict]:
     """Export u2netp ONNX from the rembg library with FP16/INT8 variants.
 
     The rembg package bundles a pre-trained u2netp checkpoint. We extract it,
@@ -594,10 +793,14 @@ def export_u2netp(output_dir: Path, target_opset: int = 15, fp32_only: bool = Fa
 
     if not fp32_only:
         try:
-            fp16_path, int8_path = quantize_all(fp32_path, "u2netp")
+            cal_data = _collect_rembg_calibration_images() if qdq else None
+            fp16_path, int8_path, int8_qdq_path = quantize_all(
+                fp32_path, "u2netp", qdq=qdq, calibration_data=cal_data)
             if not skip_verify:
                 results.append(_verify_u2netp(fp16_path, "u2netp FP16"))
                 results.append(_verify_u2netp(int8_path, "u2netp INT8"))
+                if int8_qdq_path:
+                    results.append(_verify_u2netp(int8_qdq_path, "u2netp INT8-QDQ"))
         except Exception as e:
             log(f"  WARNING: u2netp quantization failed: {e}")
             log(f"  u2netp is only {fp32_path.stat().st_size/1e6:.1f}MB — "
@@ -675,7 +878,7 @@ def export_triposr_fp32(wrapper: nn.Module, output_path: Path, opset: int = 15,
 def export_triposr_variant(model: TSR, out_dir: Path, prefix: str, label: str,
                            wrapper_fn, opset: int, static: bool, fp32_only: bool,
                            skip_split: bool, skip_verify: bool,
-                           img_np: np.ndarray) -> list[dict]:
+                           img_np: np.ndarray, qdq: bool = False) -> list[dict]:
     """Export a TripoSR variant (vanilla or ToMe) through the full pipeline.
 
     Split happens BEFORE graph optimization — optimization renames internal
@@ -705,7 +908,8 @@ def export_triposr_variant(model: TSR, out_dir: Path, prefix: str, label: str,
                                         f"{label} Split FP32"))
 
         if not fp32_only:
-            quant_paths = quantize_split_parts(p1_fp32, p2_fp32, out_dir, prefix)
+            quant_paths = quantize_split_parts(p1_fp32, p2_fp32, out_dir, prefix,
+                                               qdq=qdq)
             if not skip_verify:
                 for prec, (p1, p2) in quant_paths.items():
                     results.append(verify_split(
@@ -718,12 +922,18 @@ def export_triposr_variant(model: TSR, out_dir: Path, prefix: str, label: str,
                                        f"{label} FP32"))
 
         if not fp32_only:
-            fp16_path, int8_path = quantize_all(fp32_path, label)
+            cal_data = _collect_calibration_images() if qdq else None
+            fp16_path, int8_path, int8_qdq_path = quantize_all(
+                fp32_path, label, qdq=qdq, calibration_data=cal_data,
+                input_name="image")
             if not skip_verify:
                 results.append(verify_onnx(fp16_path, img_np, ref_np, "image",
                                            f"{label} FP16"))
                 results.append(verify_onnx(int8_path, img_np, ref_np, "image",
                                            f"{label} INT8"))
+                if int8_qdq_path:
+                    results.append(verify_onnx(int8_qdq_path, img_np, ref_np, "image",
+                                               f"{label} INT8-QDQ"))
 
     return results
 
@@ -733,7 +943,8 @@ def export_triposr_variant(model: TSR, out_dir: Path, prefix: str, label: str,
 # ===========================================================================
 
 def export_decoder(model: TSR, output_dir: Path, opset: int = 15,
-                   fp32_only: bool = False, skip_verify: bool = False) -> list[dict]:
+                   fp32_only: bool = False, skip_verify: bool = False,
+                   qdq: bool = False) -> list[dict]:
     """Export NeRF MLP decoder with FP16/INT8 variants."""
     results = []
     _print_section("NERF DECODER")
@@ -787,6 +998,15 @@ def export_decoder(model: TSR, output_dir: Path, opset: int = 15,
                                        "triplane_features", "Decoder FP16"))
             results.append(verify_onnx(int8_path, feat_np, ref_np,
                                        "triplane_features", "Decoder INT8"))
+
+        if qdq:
+            int8_qdq_path = output_dir / "nerf_decoder_int8_qdq.onnx"
+            cal_data = [np.random.randn(1024, in_ch).astype(np.float32) for _ in range(8)]
+            quantize_int8_qdq(fp32_path, int8_qdq_path, cal_data,
+                              input_name="triplane_features")
+            if not skip_verify:
+                results.append(verify_onnx(int8_qdq_path, feat_np, ref_np,
+                                           "triplane_features", "Decoder INT8-QDQ"))
 
     return results
 
@@ -1008,10 +1228,17 @@ def main():
                         help="[experimental] ToMe merge layers (default: 4 8 12)")
     parser.add_argument("--tome-only", action="store_true",
                         help="[experimental] Only export ToMe variant (skip vanilla)")
+    parser.add_argument("--qdq", action="store_true",
+                        help="Also export INT8-QDQ (static quantization) for NPU/QNN HTP")
+    parser.add_argument("--qdq-only", action="store_true",
+                        help="Only export INT8-QDQ variants (skip FP32/FP16/dynamic INT8 export)")
     parser.add_argument("--runs", type=int, default=10,
                         help="Benchmark runs (default: 10)")
     parser.add_argument("--output-dir", type=Path, default=MODELS_DIR)
     args = parser.parse_args()
+
+    if args.qdq_only:
+        args.qdq = True
 
     if (args.tome is not None or args.tome_only) and not args.experimental:
         parser.error("ToMe export requires --experimental flag")
@@ -1021,12 +1248,91 @@ def main():
 
     all_results = []
 
+    # ---- QDQ-only: quantize from existing FP32 models, no re-export ----
+    if args.qdq_only:
+        _print_section("QDQ-ONLY: Static INT8 quantization from existing FP32 models")
+
+        if not args.skip_rembg:
+            fp32 = out_dir / "u2netp.onnx"
+            qdq_path = out_dir / "u2netp_int8_qdq.onnx"
+            if fp32.exists():
+                cal = _collect_rembg_calibration_images()
+                quantize_int8_qdq(fp32, qdq_path, cal)
+                all_results.append(_verify_u2netp(qdq_path, "u2netp INT8-QDQ"))
+            else:
+                log(f"  SKIP u2netp (no FP32 at {fp32})")
+
+        if not args.skip_triposr:
+            p1 = out_dir / "triposr_part1_fp32.onnx"
+            p2 = out_dir / "triposr_part2_fp32.onnx"
+            if p1.exists() and p2.exists():
+                import onnxruntime as ort
+
+                cal_images = _collect_calibration_images()
+                p1_qdq = out_dir / "triposr_part1_int8_qdq.onnx"
+                quantize_int8_qdq(p1, p1_qdq, cal_images, input_name="image")
+
+                log("    Generating Part 2 calibration data from Part 1 outputs...")
+                p1_sess = ort.InferenceSession(str(p1), providers=["CPUExecutionProvider"])
+                p2_meta = ort.InferenceSession(str(p2), providers=["CPUExecutionProvider"])
+                p2_input_names = [inp.name for inp in p2_meta.get_inputs()]
+                del p2_meta
+
+                p2_cal = []
+                for img in cal_images:
+                    outs = p1_sess.run(None, {"image": img})
+                    out_names = [o.name for o in p1_sess.get_outputs()]
+                    sample = {n: v for n, v in zip(out_names, outs) if n in p2_input_names}
+                    p2_cal.append(sample)
+                del p1_sess
+
+                p2_qdq = out_dir / "triposr_part2_int8_qdq.onnx"
+                quantize_int8_qdq(p2, p2_qdq, p2_cal)
+
+                if not args.skip_verify:
+                    teacher = load_teacher("cpu")
+                    img_np = get_dummy_image("cpu").numpy()
+                    ref_out = TripoSRForward(teacher)(torch.from_numpy(img_np)).detach().numpy()
+                    all_results.append(verify_split(
+                        p1_qdq, p2_qdq, ref_out, img_np, "Vanilla Split INT8_QDQ"))
+            else:
+                log(f"  SKIP triposr (no split FP32 parts)")
+
+        if not args.skip_decoder:
+            dec_fp32 = out_dir / "nerf_decoder.onnx"
+            if dec_fp32.exists():
+                import onnxruntime as ort
+                sess = ort.InferenceSession(str(dec_fp32), providers=["CPUExecutionProvider"])
+                in_ch = sess.get_inputs()[0].shape[1]
+                del sess
+                cal = [np.random.randn(1024, in_ch).astype(np.float32) for _ in range(8)]
+                dec_qdq = out_dir / "nerf_decoder_int8_qdq.onnx"
+                quantize_int8_qdq(dec_fp32, dec_qdq, cal, input_name="triplane_features")
+            else:
+                log(f"  SKIP decoder (no FP32 at {dec_fp32})")
+
+        validate_all_models(out_dir)
+
+        if all_results:
+            _print_section("ACCURACY & SIZE SUMMARY")
+            log(f"{'Variant':<35} {'Size':>8} {'Max Err%':>10} {'Mean Err%':>10}")
+            log("-" * 65)
+            for r in all_results:
+                log(f"{r['label']:<35} {r['size_mb']:>7.1f}MB "
+                    f"{r['max_rel']*100:>9.4f}% {r['mean_rel']*100:>9.4f}%")
+
+        if args.deploy:
+            deploy_to_unity(out_dir, args.deploy)
+        log("\nDone!")
+        return
+
     if not args.benchmark_only:
 
         # ---- Rembg (u2netp) ----
         if not args.skip_rembg and not args.tome_only:
             all_results.extend(export_u2netp(
-                out_dir, args.opset, args.fp32_only, args.skip_verify))
+                out_dir, args.opset, args.fp32_only, args.skip_verify,
+                qdq=args.qdq))
 
         # ---- TripoSR (vanilla + optional ToMe) ----
         if not args.skip_triposr:
@@ -1041,6 +1347,7 @@ def main():
                     opset=args.opset, static=not args.dynamic,
                     fp32_only=args.fp32_only, skip_split=args.skip_split,
                     skip_verify=args.skip_verify, img_np=img_np,
+                    qdq=args.qdq,
                 ))
 
             if args.tome is not None:
@@ -1053,6 +1360,7 @@ def main():
                     opset=args.opset, static=not args.dynamic,
                     fp32_only=args.fp32_only, skip_split=args.skip_split,
                     skip_verify=args.skip_verify, img_np=img_np,
+                    qdq=args.qdq,
                 ))
 
         # ---- NeRF Decoder ----
@@ -1064,7 +1372,8 @@ def main():
                 teacher = load_teacher("cpu")
 
             all_results.extend(export_decoder(
-                teacher, out_dir, args.opset, args.fp32_only, args.skip_verify))
+                teacher, out_dir, args.opset, args.fp32_only, args.skip_verify,
+                qdq=args.qdq))
 
         # ---- Static shape validation ----
         validate_all_models(out_dir)
