@@ -305,21 +305,22 @@ def _print_section(title: str):
 # ===========================================================================
 
 def optimize_graph(input_path: Path, output_path: Path = None):
-    """Apply ORT basic graph optimizations (opt_level=1).
+    """Apply ORT graph optimizations (opt_level=ALL).
 
-    Standard ONNX-compatible transforms only (constant folding, dead node
-    elimination, CSE). No ORT-specific fused operators.
+    Uses ORT_ENABLE_ALL to fuse attention, LayerNorm, GELU, and MatMul+Add
+    patterns before quantization. Previously used ORT_ENABLE_BASIC for Sentis
+    compatibility, but we now use ORT runtime exclusively.
     """
     import onnxruntime as ort
 
     if output_path is None:
         output_path = input_path
 
-    log(f"  Optimizing graph: {input_path.name}")
+    log(f"  Optimizing graph (ALL): {input_path.name}")
     t0 = time.time()
 
     so = ort.SessionOptions()
-    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     so.optimized_model_filepath = str(output_path)
     ort.InferenceSession(str(input_path), so, providers=["CPUExecutionProvider"])
 
@@ -1337,6 +1338,9 @@ def main():
             p2 = out_dir / "triposr_part2_fp32.onnx"
             if p1.exists() and p2.exists():
                 import onnxruntime as ort
+
+                optimize_graph(p1)
+                optimize_graph(p2)
 
                 cal_images = _collect_calibration_images()
                 p1_qdq = out_dir / "triposr_part1_int8_qdq.onnx"
