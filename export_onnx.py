@@ -83,6 +83,10 @@ PRUNE_CONFIGS = {
     2: [5, 8, 12, 14],   # 12L — speed-focused pruning
 }
 
+DINO_PRUNE_CONFIGS = {
+    0: [],               # Full 12-layer DINOv2
+    1: [8, 9, 10, 11],   # 8-layer DINOv2 (remove last 4)
+}
 
 RESOLUTION_CONFIGS = [512, 384]
 
@@ -95,9 +99,13 @@ def prune_prefix(level: int) -> str:
     return f"triposr_pruned{n}L"
 
 
-def variant_prefix(prune_level: int, resolution: int = 512) -> str:
-    """Full model filename prefix including prune level and resolution."""
+def variant_prefix(prune_level: int, resolution: int = 512,
+                   dino_prune_level: int = 0) -> str:
+    """Full model filename prefix including prune level, dino pruning, and resolution."""
     base = prune_prefix(prune_level)
+    if dino_prune_level > 0:
+        n_dino = 12 - len(DINO_PRUNE_CONFIGS[dino_prune_level])
+        base += f"_dino{n_dino}L"
     if resolution != 512:
         base += f"_res{resolution}"
     return base
@@ -113,6 +121,18 @@ def remove_blocks(model: TSR, block_indices: list[int]) -> TSR:
     blocks = model.backbone.transformer_blocks
     keep = [i for i in range(len(blocks)) if i not in block_indices]
     model.backbone.transformer_blocks = torch.nn.ModuleList([blocks[i] for i in keep])
+    return model
+
+
+def remove_dino_layers(model: TSR, layer_indices: list[int]) -> TSR:
+    """Remove specific layers from DINOv2's ViT encoder (in-place).
+
+    ViT layers are residual — removing a layer means the previous layer's
+    output passes directly to the next via the residual stream.
+    """
+    encoder = model.image_tokenizer.model.encoder
+    keep = [i for i in range(len(encoder.layer)) if i not in layer_indices]
+    encoder.layer = torch.nn.ModuleList([encoder.layer[i] for i in keep])
     return model
 
 
@@ -1394,16 +1414,17 @@ def deploy_to_unity(models_dir: Path, precision: str = "all"):
         UNITY_ONNX_SOURCE.mkdir(parents=True, exist_ok=True)
         log(f"  Created {UNITY_ONNX_SOURCE}")
 
-    # Discover all triposr prefixes (vanilla + pruned × resolutions)
+    # Discover all triposr prefixes (vanilla + pruned × dino × resolutions)
     triposr_prefixes = ["triposr"]
     for level, blocks in PRUNE_CONFIGS.items():
-        for res in RESOLUTION_CONFIGS:
-            if level == 0 and res == 512:
-                continue  # already added as "triposr"
-            pfx = variant_prefix(level, res)
-            if any((models_dir / f"{pfx}_part1_{p}.onnx").exists()
-                   for p in ["fp32", "fp16", "int8", "int8_qdq"]):
-                triposr_prefixes.append(pfx)
+        for dino_level in DINO_PRUNE_CONFIGS:
+            for res in RESOLUTION_CONFIGS:
+                if level == 0 and dino_level == 0 and res == 512:
+                    continue  # already added as "triposr"
+                pfx = variant_prefix(level, res, dino_level)
+                if any((models_dir / f"{pfx}_part1_{p}.onnx").exists()
+                       for p in ["fp32", "fp16", "int8", "int8_qdq"]):
+                    triposr_prefixes.append(pfx)
 
     if precision == "all":
         copies = []
@@ -1495,6 +1516,10 @@ def main():
                         metavar="LEVEL",
                         help="Pruning levels to export: 0=full 16L, 1=13L (remove 5,12,14), "
                              "2=12L (remove 5,8,12,14). E.g. --prune 0 1 2 for all.")
+    parser.add_argument("--dino-prune", nargs="+", type=int, default=None,
+                        metavar="LEVEL",
+                        help="DINOv2 pruning levels: 0=full 12-layer, 1=8-layer (remove 8,9,10,11). "
+                             "E.g. --dino-prune 0 1 for both.")
     parser.add_argument("--resolutions", nargs="+", type=int, default=None,
                         metavar="RES",
                         help="Input resolutions to export (default: 512 only). "
@@ -1660,58 +1685,67 @@ def main():
                 out_dir, args.opset, args.fp32_only, args.skip_verify,
                 qdq=args.qdq))
 
-        # ---- TripoSR (vanilla + pruned variants × resolutions + optional ToMe) ----
+        # ---- TripoSR (vanilla + pruned variants × dino prune × resolutions + optional ToMe) ----
         if not args.skip_triposr:
             log("\nLoading teacher model...")
             teacher = load_teacher("cpu")
 
             prune_levels = args.prune if args.prune else [0]
+            dino_levels = args.dino_prune if args.dino_prune else [0]
             resolutions = args.resolutions if args.resolutions else [512]
 
             for level in prune_levels:
                 blocks = PRUNE_CONFIGS[level]
 
-                if blocks:
-                    model_for_export = copy.deepcopy(teacher)
-                    remove_blocks(model_for_export, blocks)
-                    model_for_export.to("cpu")
-                    model_for_export.eval()
-                    n_blocks = 16 - len(blocks)
-                else:
-                    model_for_export = teacher
-                    n_blocks = 16
+                for dino_level in dino_levels:
+                    dino_layers = DINO_PRUNE_CONFIGS[dino_level]
+                    needs_copy = bool(blocks) or bool(dino_layers)
 
-                for res in resolutions:
-                    prefix = variant_prefix(level, res)
-                    n_tokens = tokens_for_resolution(res)
-                    boundary, shapes = get_split_boundary(n_blocks, n_tokens)
-                    img_np = get_dummy_image("cpu", cond_image_size=res).numpy()
-
-                    if blocks and res != 512:
-                        label = f"Pruned {n_blocks}L + {res}x{res}"
-                    elif blocks:
-                        label = f"Pruned {n_blocks}L (remove {blocks})"
-                    elif res != 512:
-                        label = f"Vanilla {res}x{res}"
+                    if needs_copy:
+                        model_for_export = copy.deepcopy(teacher)
+                        if blocks:
+                            remove_blocks(model_for_export, blocks)
+                        if dino_layers:
+                            remove_dino_layers(model_for_export, dino_layers)
+                        model_for_export.to("cpu")
+                        model_for_export.eval()
                     else:
-                        label = "Vanilla"
+                        model_for_export = teacher
 
-                    if not args.tome_only:
-                        m = model_for_export
-                        r = res
-                        all_results.extend(export_triposr_variant(
-                            m, out_dir, prefix, label,
-                            wrapper_fn=lambda m=m: TripoSRForward(m),
-                            opset=args.opset, static=not args.dynamic,
-                            fp32_only=args.fp32_only, skip_split=args.skip_split,
-                            skip_verify=args.skip_verify, img_np=img_np,
-                            qdq=args.qdq, int4=args.int4,
-                            boundary_tensors=boundary, boundary_shapes=shapes,
-                            cond_image_size=r,
-                        ))
+                    n_blocks = 16 - len(blocks)
 
-                if blocks:
-                    del model_for_export
+                    for res in resolutions:
+                        prefix = variant_prefix(level, res, dino_level)
+                        n_tokens = tokens_for_resolution(res)
+                        boundary, shapes = get_split_boundary(n_blocks, n_tokens)
+                        img_np = get_dummy_image("cpu", cond_image_size=res).numpy()
+
+                        label_parts = []
+                        if blocks:
+                            label_parts.append(f"Pruned {n_blocks}L")
+                        if dino_layers:
+                            n_dino = 12 - len(dino_layers)
+                            label_parts.append(f"DINOv2 {n_dino}L")
+                        if res != 512:
+                            label_parts.append(f"{res}x{res}")
+                        label = " + ".join(label_parts) if label_parts else "Vanilla"
+
+                        if not args.tome_only:
+                            m = model_for_export
+                            r = res
+                            all_results.extend(export_triposr_variant(
+                                m, out_dir, prefix, label,
+                                wrapper_fn=lambda m=m: TripoSRForward(m),
+                                opset=args.opset, static=not args.dynamic,
+                                fp32_only=args.fp32_only, skip_split=args.skip_split,
+                                skip_verify=args.skip_verify, img_np=img_np,
+                                qdq=args.qdq, int4=args.int4,
+                                boundary_tensors=boundary, boundary_shapes=shapes,
+                                cond_image_size=r,
+                            ))
+
+                    if needs_copy:
+                        del model_for_export
 
             if args.tome is not None:
                 tome_img = get_dummy_image("cpu", cond_image_size=512).numpy()
