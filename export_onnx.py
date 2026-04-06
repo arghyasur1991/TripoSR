@@ -84,12 +84,28 @@ PRUNE_CONFIGS = {
 }
 
 
+RESOLUTION_CONFIGS = [512, 384]
+
+
 def prune_prefix(level: int) -> str:
-    """Model filename prefix for a given prune level."""
+    """Model filename prefix for a given prune level (no resolution suffix)."""
     if level == 0:
         return "triposr"
     n = 16 - len(PRUNE_CONFIGS[level])
     return f"triposr_pruned{n}L"
+
+
+def variant_prefix(prune_level: int, resolution: int = 512) -> str:
+    """Full model filename prefix including prune level and resolution."""
+    base = prune_prefix(prune_level)
+    if resolution != 512:
+        base += f"_res{resolution}"
+    return base
+
+
+def tokens_for_resolution(resolution: int) -> int:
+    """Number of DINOv2 tokens (patches + CLS) for a given input resolution."""
+    return (resolution // 16) ** 2 + 1
 
 
 def remove_blocks(model: TSR, block_indices: list[int]) -> TSR:
@@ -100,13 +116,17 @@ def remove_blocks(model: TSR, block_indices: list[int]) -> TSR:
     return model
 
 
-def get_split_boundary(n_blocks: int) -> tuple[list[str], dict[str, list[int]]]:
-    """Compute split boundary tensors and known shapes for a model with n_blocks."""
+def get_split_boundary(n_blocks: int, n_tokens: int = 1025) -> tuple[list[str], dict[str, list[int]]]:
+    """Compute split boundary tensors and known shapes for a model with n_blocks.
+
+    n_tokens: number of DINOv2 encoder tokens (depends on input resolution).
+      512x512 → 1025, 384x384 → 577, 256x256 → 257.
+    """
     split_idx = n_blocks // 2 - 1
     tensor_name = f"/backbone/transformer_blocks.{split_idx}/Add_2_output_0"
     boundary = ["/Reshape_output_0", tensor_name]
     shapes = {
-        "/Reshape_output_0": [1, 1025, 768],
+        "/Reshape_output_0": [1, n_tokens, 768],
         tensor_name: [1, 3072, 1024],
     }
     return boundary, shapes
@@ -323,11 +343,11 @@ def load_teacher(device: str = "cpu") -> TSR:
     return model
 
 
-def get_dummy_image(device: str = "cpu") -> torch.Tensor:
-    """Preprocessed image tensor (1, 3, 512, 512) in [0, 1]."""
+def get_dummy_image(device: str = "cpu", cond_image_size: int = 512) -> torch.Tensor:
+    """Preprocessed image tensor (1, 3, H, W) in [0, 1]."""
     img = prepare_image(Path(__file__).parent / "test_images" / "examples" / "flamingo.png")
     processor = ImagePreprocessor()
-    rgb = processor(img, 512)
+    rgb = processor(img, cond_image_size)
     return rgb.permute(0, 3, 1, 2).to(device)
 
 
@@ -610,8 +630,8 @@ class _MultiInputCalibrationReader:
         return sample
 
 
-def _collect_calibration_images(n: int = 8) -> list[np.ndarray]:
-    """Collect preprocessed calibration images for TripoSR (1, 3, 512, 512)."""
+def _collect_calibration_images(n: int = 8, cond_image_size: int = 512) -> list[np.ndarray]:
+    """Collect preprocessed calibration images for TripoSR."""
     test_dir = Path(__file__).parent / "test_images"
     paths = []
     for subdir in ["examples", "novel"]:
@@ -626,9 +646,9 @@ def _collect_calibration_images(n: int = 8) -> list[np.ndarray]:
     images = []
     for p in paths:
         img = prepare_image(p)
-        rgb = processor(img, 512)
+        rgb = processor(img, cond_image_size)
         images.append(rgb.permute(0, 3, 1, 2).numpy())
-    log(f"    Collected {len(images)} calibration images")
+    log(f"    Collected {len(images)} calibration images ({cond_image_size}x{cond_image_size})")
     return images
 
 
@@ -885,7 +905,8 @@ def split_model(input_path: Path, output_dir: Path, prefix: str = "triposr",
 
 
 def quantize_split_parts(part1_fp32: Path, part2_fp32: Path, output_dir: Path,
-                         prefix: str = "triposr", qdq: bool = False):
+                         prefix: str = "triposr", qdq: bool = False,
+                         cond_image_size: int = 512):
     """Quantize split FP32 parts to FP16 and INT8 independently."""
     p1_fp16 = output_dir / f"{prefix}_part1_fp16.onnx"
     p2_fp16 = output_dir / f"{prefix}_part2_fp16.onnx"
@@ -909,7 +930,7 @@ def quantize_split_parts(part1_fp32: Path, part2_fp32: Path, output_dir: Path,
         p1_int8_qdq = output_dir / f"{prefix}_part1_int8_qdq.onnx"
         p2_int8_qdq = output_dir / f"{prefix}_part2_int8_qdq.onnx"
 
-        cal_images = _collect_calibration_images()
+        cal_images = _collect_calibration_images(cond_image_size=cond_image_size)
         quantize_int8_qdq(part1_fp32, p1_int8_qdq, cal_images, input_name="image")
 
         # Part2 calibration: run part1 to collect intermediate tensors
@@ -1030,14 +1051,15 @@ def _verify_u2netp(model_path: Path, label: str) -> dict:
 # ===========================================================================
 
 def export_triposr_fp32(wrapper: nn.Module, output_path: Path, opset: int = 15,
-                        label: str = "FP32", static: bool = True) -> torch.Tensor:
+                        label: str = "FP32", static: bool = True,
+                        cond_image_size: int = 512) -> torch.Tensor:
     """Export TripoSR wrapper to ONNX FP32 (full unsplit model)."""
     mode_tag = "static" if static else "dynamic batch"
     log(f"\n  Exporting {label} to {output_path.name} (opset {opset}, {mode_tag})...")
     wrapper = wrapper.cpu()
     wrapper.eval()
 
-    dummy = get_dummy_image("cpu")
+    dummy = get_dummy_image("cpu", cond_image_size=cond_image_size)
     log(f"    Input: {dummy.shape}, dtype={dummy.dtype}")
 
     with torch.no_grad():
@@ -1072,6 +1094,7 @@ def export_triposr_variant(model: TSR, out_dir: Path, prefix: str, label: str,
                            int4: bool = False,
                            boundary_tensors: list[str] | None = None,
                            boundary_shapes: dict[str, list[int]] | None = None,
+                           cond_image_size: int = 512,
                            ) -> list[dict]:
     """Export a TripoSR variant (vanilla, pruned, or ToMe) through the full pipeline.
 
@@ -1083,7 +1106,7 @@ def export_triposr_variant(model: TSR, out_dir: Path, prefix: str, label: str,
 
     fp32_path = out_dir / f"{prefix}_fp32.onnx"
     ref_out = export_triposr_fp32(wrapper_fn(), fp32_path, opset, f"{label} FP32",
-                                  static=static)
+                                  static=static, cond_image_size=cond_image_size)
     ref_np = ref_out.numpy()
 
     if not skip_split:
@@ -1125,7 +1148,7 @@ def export_triposr_variant(model: TSR, out_dir: Path, prefix: str, label: str,
 
         if not fp32_only:
             quant_paths = quantize_split_parts(p1_fp32, p2_fp32, out_dir, prefix,
-                                               qdq=qdq)
+                                               qdq=qdq, cond_image_size=cond_image_size)
             quant_paths.update(int4_paths)
             if not skip_verify:
                 for prec, (p1, p2) in quant_paths.items():
@@ -1139,7 +1162,7 @@ def export_triposr_variant(model: TSR, out_dir: Path, prefix: str, label: str,
                                        f"{label} FP32"))
 
         if not fp32_only:
-            cal_data = _collect_calibration_images() if qdq else None
+            cal_data = _collect_calibration_images(cond_image_size=cond_image_size) if qdq else None
             fp16_path, int8_path, int8_qdq_path = quantize_all(
                 fp32_path, label, qdq=qdq, calibration_data=cal_data,
                 input_name="image")
@@ -1371,15 +1394,16 @@ def deploy_to_unity(models_dir: Path, precision: str = "all"):
         UNITY_ONNX_SOURCE.mkdir(parents=True, exist_ok=True)
         log(f"  Created {UNITY_ONNX_SOURCE}")
 
-    # Discover all triposr prefixes (vanilla + pruned)
+    # Discover all triposr prefixes (vanilla + pruned × resolutions)
     triposr_prefixes = ["triposr"]
     for level, blocks in PRUNE_CONFIGS.items():
-        if level == 0:
-            continue
-        pfx = prune_prefix(level)
-        if any((models_dir / f"{pfx}_part1_{p}.onnx").exists()
-               for p in ["fp32", "fp16", "int8", "int8_qdq"]):
-            triposr_prefixes.append(pfx)
+        for res in RESOLUTION_CONFIGS:
+            if level == 0 and res == 512:
+                continue  # already added as "triposr"
+            pfx = variant_prefix(level, res)
+            if any((models_dir / f"{pfx}_part1_{p}.onnx").exists()
+                   for p in ["fp32", "fp16", "int8", "int8_qdq"]):
+                triposr_prefixes.append(pfx)
 
     if precision == "all":
         copies = []
@@ -1471,6 +1495,10 @@ def main():
                         metavar="LEVEL",
                         help="Pruning levels to export: 0=full 16L, 1=13L (remove 5,12,14), "
                              "2=12L (remove 5,8,12,14). E.g. --prune 0 1 2 for all.")
+    parser.add_argument("--resolutions", nargs="+", type=int, default=None,
+                        metavar="RES",
+                        help="Input resolutions to export (default: 512 only). "
+                             "E.g. --resolutions 512 384 for both.")
     parser.add_argument("--runs", type=int, default=10,
                         help="Benchmark runs (default: 10)")
     parser.add_argument("--output-dir", type=Path, default=MODELS_DIR)
@@ -1632,46 +1660,61 @@ def main():
                 out_dir, args.opset, args.fp32_only, args.skip_verify,
                 qdq=args.qdq))
 
-        # ---- TripoSR (vanilla + pruned variants + optional ToMe) ----
+        # ---- TripoSR (vanilla + pruned variants × resolutions + optional ToMe) ----
         if not args.skip_triposr:
             log("\nLoading teacher model...")
             teacher = load_teacher("cpu")
-            img_np = get_dummy_image("cpu").numpy()
 
             prune_levels = args.prune if args.prune else [0]
+            resolutions = args.resolutions if args.resolutions else [512]
+
             for level in prune_levels:
                 blocks = PRUNE_CONFIGS[level]
-                prefix = prune_prefix(level)
 
                 if blocks:
                     model_for_export = copy.deepcopy(teacher)
                     remove_blocks(model_for_export, blocks)
                     model_for_export.to("cpu")
                     model_for_export.eval()
-                    n = 16 - len(blocks)
-                    boundary, shapes = get_split_boundary(n)
-                    label = f"Pruned {n}L (remove {blocks})"
+                    n_blocks = 16 - len(blocks)
                 else:
                     model_for_export = teacher
-                    boundary, shapes = None, None
-                    label = "Vanilla"
+                    n_blocks = 16
 
-                if not args.tome_only:
-                    m = model_for_export
-                    all_results.extend(export_triposr_variant(
-                        m, out_dir, prefix, label,
-                        wrapper_fn=lambda m=m: TripoSRForward(m),
-                        opset=args.opset, static=not args.dynamic,
-                        fp32_only=args.fp32_only, skip_split=args.skip_split,
-                        skip_verify=args.skip_verify, img_np=img_np,
-                        qdq=args.qdq, int4=args.int4,
-                        boundary_tensors=boundary, boundary_shapes=shapes,
-                    ))
+                for res in resolutions:
+                    prefix = variant_prefix(level, res)
+                    n_tokens = tokens_for_resolution(res)
+                    boundary, shapes = get_split_boundary(n_blocks, n_tokens)
+                    img_np = get_dummy_image("cpu", cond_image_size=res).numpy()
+
+                    if blocks and res != 512:
+                        label = f"Pruned {n_blocks}L + {res}x{res}"
+                    elif blocks:
+                        label = f"Pruned {n_blocks}L (remove {blocks})"
+                    elif res != 512:
+                        label = f"Vanilla {res}x{res}"
+                    else:
+                        label = "Vanilla"
+
+                    if not args.tome_only:
+                        m = model_for_export
+                        r = res
+                        all_results.extend(export_triposr_variant(
+                            m, out_dir, prefix, label,
+                            wrapper_fn=lambda m=m: TripoSRForward(m),
+                            opset=args.opset, static=not args.dynamic,
+                            fp32_only=args.fp32_only, skip_split=args.skip_split,
+                            skip_verify=args.skip_verify, img_np=img_np,
+                            qdq=args.qdq, int4=args.int4,
+                            boundary_tensors=boundary, boundary_shapes=shapes,
+                            cond_image_size=r,
+                        ))
 
                 if blocks:
                     del model_for_export
 
             if args.tome is not None:
+                tome_img = get_dummy_image("cpu", cond_image_size=512).numpy()
                 all_results.extend(export_triposr_variant(
                     teacher, out_dir, "triposr_tome",
                     f"ToMe r={args.tome}",
@@ -1680,7 +1723,7 @@ def main():
                         merge_layers=args.tome_layers),
                     opset=args.opset, static=not args.dynamic,
                     fp32_only=args.fp32_only, skip_split=args.skip_split,
-                    skip_verify=args.skip_verify, img_np=img_np,
+                    skip_verify=args.skip_verify, img_np=tome_img,
                     qdq=args.qdq, int4=args.int4,
                 ))
 
