@@ -49,6 +49,7 @@ Usage:
 """
 
 import argparse
+import copy
 import shutil
 import sys
 import time
@@ -73,6 +74,42 @@ SPLIT_BOUNDARY_TENSORS = [
     "/Reshape_output_0",
     "/backbone/transformer_blocks.7/Add_2_output_0",
 ]
+
+# Pruning configurations: level -> list of transformer block indices to remove.
+# Block indices refer to the original 16-block model.
+PRUNE_CONFIGS = {
+    0: [],               # Full 16L — no pruning
+    1: [5, 12, 14],      # 13L — quality-focused pruning
+    2: [5, 8, 12, 14],   # 12L — speed-focused pruning
+}
+
+
+def prune_prefix(level: int) -> str:
+    """Model filename prefix for a given prune level."""
+    if level == 0:
+        return "triposr"
+    n = 16 - len(PRUNE_CONFIGS[level])
+    return f"triposr_pruned{n}L"
+
+
+def remove_blocks(model: TSR, block_indices: list[int]) -> TSR:
+    """Remove transformer blocks from the model (in-place)."""
+    blocks = model.backbone.transformer_blocks
+    keep = [i for i in range(len(blocks)) if i not in block_indices]
+    model.backbone.transformer_blocks = torch.nn.ModuleList([blocks[i] for i in keep])
+    return model
+
+
+def get_split_boundary(n_blocks: int) -> tuple[list[str], dict[str, list[int]]]:
+    """Compute split boundary tensors and known shapes for a model with n_blocks."""
+    split_idx = n_blocks // 2 - 1
+    tensor_name = f"/backbone/transformer_blocks.{split_idx}/Add_2_output_0"
+    boundary = ["/Reshape_output_0", tensor_name]
+    shapes = {
+        "/Reshape_output_0": [1, 1025, 768],
+        tensor_name: [1, 3072, 1024],
+    }
+    return boundary, shapes
 
 
 def log(msg: str):
@@ -788,11 +825,14 @@ def quantize_all(fp32_path: Path, name: str, qdq: bool = False,
 # Splitting (TripoSR only)
 # ===========================================================================
 
-def split_model(input_path: Path, output_dir: Path, prefix: str = "triposr"):
-    """Split TripoSR ONNX at transformer block 8 boundary.
+def split_model(input_path: Path, output_dir: Path, prefix: str = "triposr",
+                boundary_tensors: list[str] | None = None,
+                boundary_shapes: dict[str, list[int]] | None = None):
+    """Split TripoSR ONNX at a transformer block boundary.
 
-    Part 1: image_tokenizer + backbone blocks 0-7
-    Part 2: backbone blocks 8-15 + post_processor
+    Default boundary is block 7/8 for the full 16L model. For pruned models,
+    pass the correct boundary via boundary_tensors/boundary_shapes (use
+    get_split_boundary() to compute them).
 
     Runs onnx.shape_inference first to populate value_infos for all
     intermediate tensors — required by the ONNX Extractor.
@@ -801,7 +841,14 @@ def split_model(input_path: Path, output_dir: Path, prefix: str = "triposr"):
     from onnx import shape_inference
     from onnx.utils import Extractor
 
-    log(f"\n  Splitting {input_path.name} at block 8 boundary...")
+    boundary = boundary_tensors or SPLIT_BOUNDARY_TENSORS
+    shapes = boundary_shapes or {
+        "/Reshape_output_0": [1, 1025, 768],
+        "/backbone/transformer_blocks.7/Add_2_output_0": [1, 3072, 1024],
+    }
+
+    split_desc = boundary[1].split("/")[-1].split(".")[0] if boundary else "block8"
+    log(f"\n  Splitting {input_path.name} at {split_desc} boundary...")
     log(f"    Running shape inference...")
     model = shape_inference.infer_shapes(
         onnx.load(str(input_path)), data_prop=True
@@ -814,23 +861,17 @@ def split_model(input_path: Path, output_dir: Path, prefix: str = "triposr"):
     part2_path = output_dir / f"{prefix}_part2_fp32.onnx"
 
     ext1 = Extractor(model)
-    part1 = ext1.extract_model([orig_input], SPLIT_BOUNDARY_TENSORS)
+    part1 = ext1.extract_model([orig_input], boundary)
     onnx.save(part1, str(part1_path))
     log(f"    Part 1: {part1_path.name} ({part1_path.stat().st_size/1e6:.1f}MB, "
         f"{len(part1.graph.node)} nodes)")
 
     ext2 = Extractor(model)
-    part2 = ext2.extract_model(SPLIT_BOUNDARY_TENSORS, [orig_output])
+    part2 = ext2.extract_model(boundary, [orig_output])
 
-    # Fix any symbolic dims that shape inference couldn't resolve statically.
-    # The full model uses static shapes, so all split tensor dims are known.
-    known_shapes = {
-        "/Reshape_output_0": [1, 1025, 768],
-        "/backbone/transformer_blocks.7/Add_2_output_0": [1, 3072, 1024],
-    }
     for inp in part2.graph.input:
-        if inp.name in known_shapes:
-            for i, dim_val in enumerate(known_shapes[inp.name]):
+        if inp.name in shapes:
+            for i, dim_val in enumerate(shapes[inp.name]):
                 dim = inp.type.tensor_type.shape.dim[i]
                 dim.ClearField("dim_param")
                 dim.dim_value = dim_val
@@ -1028,8 +1069,11 @@ def export_triposr_variant(model: TSR, out_dir: Path, prefix: str, label: str,
                            wrapper_fn, opset: int, static: bool, fp32_only: bool,
                            skip_split: bool, skip_verify: bool,
                            img_np: np.ndarray, qdq: bool = False,
-                           int4: bool = False) -> list[dict]:
-    """Export a TripoSR variant (vanilla or ToMe) through the full pipeline.
+                           int4: bool = False,
+                           boundary_tensors: list[str] | None = None,
+                           boundary_shapes: dict[str, list[int]] | None = None,
+                           ) -> list[dict]:
+    """Export a TripoSR variant (vanilla, pruned, or ToMe) through the full pipeline.
 
     Split happens BEFORE graph optimization — optimization renames internal
     tensors which would break the split boundary lookup.
@@ -1043,8 +1087,9 @@ def export_triposr_variant(model: TSR, out_dir: Path, prefix: str, label: str,
     ref_np = ref_out.numpy()
 
     if not skip_split:
-        # Split from the unoptimized graph (tensor names intact)
-        p1_fp32, p2_fp32 = split_model(fp32_path, out_dir, prefix)
+        p1_fp32, p2_fp32 = split_model(fp32_path, out_dir, prefix,
+                                        boundary_tensors=boundary_tensors,
+                                        boundary_shapes=boundary_shapes)
 
         # INT4 must happen BEFORE any optimizer — both transformer_optimize
         # and optimize_graph convert weight-carrying MatMul ops into Gemm/
@@ -1312,9 +1357,8 @@ def benchmark_onnx(model_path: Path, n_runs: int = 10) -> float:
 def deploy_to_unity(models_dir: Path, precision: str = "all"):
     """Copy deployment models to Unity OnnxSource directory.
 
-    When precision="all", copies all available variants with precision suffixes
-    (e.g. triposr_part1_fp32.onnx, triposr_part1_int8.onnx). The Unity wizard
-    then picks the desired precision at deploy time.
+    When precision="all", copies all available variants (vanilla + pruned) with
+    precision suffixes. The Unity wizard picks quality+precision at deploy time.
 
     When a specific precision is given, copies only that variant with generic
     names (for direct use without the wizard).
@@ -1327,24 +1371,39 @@ def deploy_to_unity(models_dir: Path, precision: str = "all"):
         UNITY_ONNX_SOURCE.mkdir(parents=True, exist_ok=True)
         log(f"  Created {UNITY_ONNX_SOURCE}")
 
+    # Discover all triposr prefixes (vanilla + pruned)
+    triposr_prefixes = ["triposr"]
+    for level, blocks in PRUNE_CONFIGS.items():
+        if level == 0:
+            continue
+        pfx = prune_prefix(level)
+        if any((models_dir / f"{pfx}_part1_{p}.onnx").exists()
+               for p in ["fp32", "fp16", "int8", "int8_qdq"]):
+            triposr_prefixes.append(pfx)
+
     if precision == "all":
         copies = []
-        for prec in ["fp32", "fp16", "int8", "int4"]:
-            for part in ["triposr_part1", "triposr_part2"]:
-                src = models_dir / f"{part}_{prec}.onnx"
-                if src.exists():
-                    copies.append((src, f"{part}_{prec}.onnx"))
+        for pfx in triposr_prefixes:
+            for prec in ["fp32", "fp16", "int8", "int4", "int8_qdq"]:
+                for part in ["part1", "part2"]:
+                    src = models_dir / f"{pfx}_{part}_{prec}.onnx"
+                    if src.exists():
+                        copies.append((src, src.name))
 
+        for prec in ["fp32", "fp16", "int8", "int8_qdq"]:
             dec_name = "nerf_decoder.onnx" if prec == "fp32" else f"nerf_decoder_{prec}.onnx"
             dec_src = models_dir / dec_name
             if dec_src.exists():
                 dst_name = f"nerf_decoder_{prec}.onnx" if prec != "fp32" else "nerf_decoder_fp32.onnx"
                 copies.append((dec_src, dst_name))
 
-        # u2netp FP32 only (FP16 broken, INT8 same size)
         u2netp_src = models_dir / "u2netp.onnx"
         if u2netp_src.exists():
             copies.append((u2netp_src, "u2netp.onnx"))
+
+        u2netp_qdq = models_dir / "u2netp_int8_qdq.onnx"
+        if u2netp_qdq.exists():
+            copies.append((u2netp_qdq, "u2netp_int8_qdq.onnx"))
     else:
         dec_name = "nerf_decoder.onnx" if precision == "fp32" else f"nerf_decoder_{precision}.onnx"
         copies = [
@@ -1408,6 +1467,10 @@ def main():
                         help="Also export INT4 weight-only quantization (MatMulNBits)")
     parser.add_argument("--int4-only", action="store_true",
                         help="Only export INT4 variants from existing FP32 split parts")
+    parser.add_argument("--prune", nargs="+", type=int, default=None,
+                        metavar="LEVEL",
+                        help="Pruning levels to export: 0=full 16L, 1=13L (remove 5,12,14), "
+                             "2=12L (remove 5,8,12,14). E.g. --prune 0 1 2 for all.")
     parser.add_argument("--runs", type=int, default=10,
                         help="Benchmark runs (default: 10)")
     parser.add_argument("--output-dir", type=Path, default=MODELS_DIR)
@@ -1569,21 +1632,44 @@ def main():
                 out_dir, args.opset, args.fp32_only, args.skip_verify,
                 qdq=args.qdq))
 
-        # ---- TripoSR (vanilla + optional ToMe) ----
+        # ---- TripoSR (vanilla + pruned variants + optional ToMe) ----
         if not args.skip_triposr:
             log("\nLoading teacher model...")
             teacher = load_teacher("cpu")
             img_np = get_dummy_image("cpu").numpy()
 
-            if not args.tome_only:
-                all_results.extend(export_triposr_variant(
-                    teacher, out_dir, "triposr", "Vanilla",
-                    wrapper_fn=lambda: TripoSRForward(teacher),
-                    opset=args.opset, static=not args.dynamic,
-                    fp32_only=args.fp32_only, skip_split=args.skip_split,
-                    skip_verify=args.skip_verify, img_np=img_np,
-                    qdq=args.qdq, int4=args.int4,
-                ))
+            prune_levels = args.prune if args.prune else [0]
+            for level in prune_levels:
+                blocks = PRUNE_CONFIGS[level]
+                prefix = prune_prefix(level)
+
+                if blocks:
+                    model_for_export = copy.deepcopy(teacher)
+                    remove_blocks(model_for_export, blocks)
+                    model_for_export.to("cpu")
+                    model_for_export.eval()
+                    n = 16 - len(blocks)
+                    boundary, shapes = get_split_boundary(n)
+                    label = f"Pruned {n}L (remove {blocks})"
+                else:
+                    model_for_export = teacher
+                    boundary, shapes = None, None
+                    label = "Vanilla"
+
+                if not args.tome_only:
+                    m = model_for_export
+                    all_results.extend(export_triposr_variant(
+                        m, out_dir, prefix, label,
+                        wrapper_fn=lambda m=m: TripoSRForward(m),
+                        opset=args.opset, static=not args.dynamic,
+                        fp32_only=args.fp32_only, skip_split=args.skip_split,
+                        skip_verify=args.skip_verify, img_np=img_np,
+                        qdq=args.qdq, int4=args.int4,
+                        boundary_tensors=boundary, boundary_shapes=shapes,
+                    ))
+
+                if blocks:
+                    del model_for_export
 
             if args.tome is not None:
                 all_results.extend(export_triposr_variant(

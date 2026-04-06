@@ -29,8 +29,20 @@ OUTPUT_DIR = Path(__file__).parent / "output" / "layer_pruning"
 TEST_IMAGES_DIR = Path(__file__).parent / "test_images"
 
 
-def collect_test_images(n_max: int = 6) -> list[Path]:
-    """Collect a representative set of test images."""
+def collect_test_images(full: bool = False) -> list[Path]:
+    """Collect test images. full=True uses the same 20-image set as reconstruct_compare."""
+    if full:
+        images = []
+        for subdir in ["examples", "novel", "training"]:
+            d = TEST_IMAGES_DIR / subdir
+            if not d.exists():
+                continue
+            if subdir == "novel":
+                images.extend(sorted(d.glob("*_nobg.png")))
+            else:
+                images.extend(sorted(d.glob("*.png")))
+        return images
+
     priority = [
         TEST_IMAGES_DIR / "examples" / "chair.png",
         TEST_IMAGES_DIR / "examples" / "hamburger.png",
@@ -39,12 +51,7 @@ def collect_test_images(n_max: int = 6) -> list[Path]:
         TEST_IMAGES_DIR / "novel" / "shoe_nobg.png",
         TEST_IMAGES_DIR / "novel" / "clock_nobg.png",
     ]
-    result = [p for p in priority if p.exists()]
-    if len(result) < n_max:
-        for p in sorted(TEST_IMAGES_DIR.rglob("*.png")):
-            if p not in result and len(result) < n_max:
-                result.append(p)
-    return result[:n_max]
+    return [p for p in priority if p.exists()]
 
 
 def load_model(device: str) -> TSR:
@@ -57,14 +64,23 @@ def load_model(device: str) -> TSR:
 
 
 def run_inference(model: TSR, image_path: Path, device: str,
-                  resolution: int = 128) -> trimesh.Trimesh:
-    """Run forward pass + mesh extraction for a single image."""
+                  resolution: int = 128, vertex_color: bool = False,
+                  measure_latency: bool = False) -> tuple[trimesh.Trimesh, float]:
+    """Run forward pass + mesh extraction. Returns (mesh, forward_latency_s)."""
     img = prepare_image(image_path)
     with torch.no_grad():
+        if device == "mps":
+            torch.mps.synchronize()
+        t0 = time.perf_counter()
         scene_codes = model(img, device)
+        if device == "mps":
+            torch.mps.synchronize()
+        fwd_time = time.perf_counter() - t0
+
+        model.set_marching_cubes_resolution(resolution)
         meshes = model.extract_mesh(
-            scene_codes, has_vertex_color=False, resolution=resolution)
-    return meshes[0]
+            scene_codes, has_vertex_color=vertex_color, resolution=resolution)
+    return meshes[0], fwd_time
 
 
 def compute_metrics(baseline: trimesh.Trimesh, test: trimesh.Trimesh,
@@ -118,7 +134,9 @@ def remove_blocks(model: TSR, block_indices: list[int]) -> TSR:
 
 def run_pruning_experiment(model: TSR, device: str, removed_blocks: list[int],
                            test_images: list[Path], baseline_meshes: dict,
-                           save_dir: Path | None = None) -> dict:
+                           save_dir: Path | None = None,
+                           resolution: int = 128, vertex_color: bool = False,
+                           measure_latency: bool = False) -> dict:
     """Remove blocks and evaluate quality."""
     label = "remove_" + "_".join(str(b) for b in removed_blocks)
     n_remaining = 16 - len(removed_blocks)
@@ -129,13 +147,22 @@ def run_pruning_experiment(model: TSR, device: str, removed_blocks: list[int],
     pruned.to(device)
     pruned.eval()
 
+    # Warmup run for latency measurement
+    if measure_latency and test_images:
+        run_inference(pruned, test_images[0], device, resolution=resolution,
+                      vertex_color=False)
+
     print(f"\n  [{label}] {n_remaining} blocks, -{removed_params:.1f}M params")
 
     results = []
+    fwd_times = []
     for img_path in test_images:
         name = img_path.stem
         try:
-            mesh = run_inference(pruned, img_path, device)
+            mesh, fwd_t = run_inference(pruned, img_path, device,
+                                        resolution=resolution,
+                                        vertex_color=vertex_color)
+            fwd_times.append(fwd_t)
         except Exception as e:
             print(f"    {name}: CRASH ({e})")
             results.append({"image": name, "cd": 100.0, "f1": 0.0, "f2": 0.0})
@@ -143,9 +170,10 @@ def run_pruning_experiment(model: TSR, device: str, removed_blocks: list[int],
 
         metrics = compute_metrics(baseline_meshes[name], mesh)
         status = "PASS" if metrics["cd"] < 2.0 and metrics["f1"] > 85.0 else "FAIL"
+        lat_str = f" {fwd_t:.1f}s" if measure_latency else ""
         print(f"    {name}: CD={metrics['cd']:.3f}% F@1%={metrics['f1']:.1f} "
-              f"F@2%={metrics['f2']:.1f} [{status}]")
-        results.append({"image": name, **metrics})
+              f"F@2%={metrics['f2']:.1f} [{status}]{lat_str}")
+        results.append({"image": name, "fwd_time": fwd_t, **metrics})
 
         if save_dir:
             out_path = save_dir / label / f"{name}.obj"
@@ -159,8 +187,10 @@ def run_pruning_experiment(model: TSR, device: str, removed_blocks: list[int],
     avg_cd = np.mean([r["cd"] for r in results])
     avg_f1 = np.mean([r["f1"] for r in results])
     avg_f2 = np.mean([r["f2"] for r in results])
+    avg_fwd = np.mean(fwd_times) if fwd_times else 0.0
 
-    print(f"    AVG: CD={avg_cd:.3f}% F@1%={avg_f1:.1f} F@2%={avg_f2:.1f}")
+    lat_str = f"  Avg fwd: {avg_fwd:.2f}s" if measure_latency else ""
+    print(f"    AVG: CD={avg_cd:.3f}% F@1%={avg_f1:.1f} F@2%={avg_f2:.1f}{lat_str}")
 
     return {
         "removed": removed_blocks,
@@ -169,6 +199,7 @@ def run_pruning_experiment(model: TSR, device: str, removed_blocks: list[int],
         "avg_cd": avg_cd,
         "avg_f1": avg_f1,
         "avg_f2": avg_f2,
+        "avg_fwd_time": avg_fwd,
         "per_image": results,
     }
 
@@ -185,6 +216,14 @@ def main():
     parser.add_argument("--device", default="auto")
     parser.add_argument("--no-save", action="store_true",
                         help="Don't save OBJ meshes")
+    parser.add_argument("--full-test", action="store_true",
+                        help="Use full 20-image test set (same as reconstruct_compare)")
+    parser.add_argument("--vertex-color", action="store_true",
+                        help="Generate meshes with vertex colors (slower)")
+    parser.add_argument("--resolution", type=int, default=128,
+                        help="Mesh extraction resolution (default: 128, use 256 for final)")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="Measure forward pass latency (includes baseline comparison)")
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -193,8 +232,9 @@ def main():
     else:
         device = args.device
 
-    test_images = collect_test_images()
-    print(f"Test images: {len(test_images)}, device: {device}")
+    test_images = collect_test_images(full=args.full_test)
+    print(f"Test images: {len(test_images)}, device: {device}, "
+          f"resolution: {args.resolution}, vertex_color: {args.vertex_color}")
     for p in test_images:
         print(f"  {p.relative_to(TEST_IMAGES_DIR)}")
 
@@ -204,27 +244,50 @@ def main():
 
     save_dir = None if args.no_save else OUTPUT_DIR
 
-    # Generate baseline meshes
+    # Generate baseline meshes (and optional latency benchmark)
     print("\nGenerating baseline meshes...")
     baseline_meshes = {}
+    baseline_fwd_times = []
+
+    # Warmup
+    if args.benchmark and test_images:
+        run_inference(model, test_images[0], device, resolution=args.resolution,
+                      vertex_color=False)
+
     for img_path in test_images:
         name = img_path.stem
         print(f"  {name}...", end="", flush=True)
-        mesh = run_inference(model, img_path, device)
+        mesh, fwd_t = run_inference(model, img_path, device,
+                                    resolution=args.resolution,
+                                    vertex_color=args.vertex_color)
         baseline_meshes[name] = mesh
-        print(f" {mesh.vertices.shape[0]} verts")
+        baseline_fwd_times.append(fwd_t)
+        lat_str = f" fwd={fwd_t:.2f}s" if args.benchmark else ""
+        print(f" {mesh.vertices.shape[0]} verts{lat_str}")
 
         if save_dir:
-            bl_dir = save_dir / "baseline"
+            bl_dir = save_dir / "baseline_full" if args.full_test else save_dir / "baseline"
             bl_dir.mkdir(parents=True, exist_ok=True)
             mesh.export(str(bl_dir / f"{name}.obj"))
+
+    if args.benchmark:
+        avg_bl = np.mean(baseline_fwd_times)
+        print(f"  Baseline avg forward: {avg_bl:.2f}s ({len(test_images)} images)")
 
     if args.multi:
         print(f"\n{'='*60}")
         print(f"Multi-block removal: removing blocks {args.multi}")
         print(f"{'='*60}")
         result = run_pruning_experiment(
-            model, device, args.multi, test_images, baseline_meshes, save_dir)
+            model, device, args.multi, test_images, baseline_meshes, save_dir,
+            resolution=args.resolution, vertex_color=args.vertex_color,
+            measure_latency=args.benchmark)
+
+        if args.benchmark:
+            pruned_fwd = result["avg_fwd_time"]
+            speedup = avg_bl / pruned_fwd if pruned_fwd > 0 else 0
+            print(f"\n  PERFORMANCE: baseline={avg_bl:.2f}s  pruned={pruned_fwd:.2f}s  "
+                  f"speedup={speedup:.2f}x")
 
         if args.export:
             print("\n  Exporting pruned model to ONNX...")
@@ -308,7 +371,9 @@ def main():
     all_results = []
     for block_idx in blocks_to_test:
         result = run_pruning_experiment(
-            model, device, [block_idx], test_images, baseline_meshes, save_dir)
+            model, device, [block_idx], test_images, baseline_meshes, save_dir,
+            resolution=args.resolution, vertex_color=args.vertex_color,
+            measure_latency=args.benchmark)
         all_results.append(result)
 
     # Rank by quality impact
