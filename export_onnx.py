@@ -512,6 +512,36 @@ def quantize_int8(input_path: Path, output_path: Path):
         f"{fsize/fp32_size*100:.0f}%)")
 
 
+def quantize_int4(input_path: Path, output_path: Path, block_size: int = 128,
+                  is_symmetric: bool = True):
+    """Apply INT4 weight-only quantization via MatMulNBits (RTN algorithm).
+
+    Converts MatMul weight tensors from FP32 to 4-bit block-quantized integers.
+    At inference, weights are dequantized to FP32 for matmul. Halves model size
+    vs INT8 with minimal quality loss on transformer architectures.
+    """
+    import onnx
+    from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
+
+    log(f"  INT4: {output_path.name} (block_size={block_size}, "
+        f"symmetric={is_symmetric})")
+
+    model = onnx.load(str(input_path))
+    quantizer = MatMulNBitsQuantizer(
+        model,
+        bits=4,
+        block_size=block_size,
+        is_symmetric=is_symmetric,
+    )
+    quantizer.process()
+    quantizer.model.save_model_to_file(str(output_path))
+
+    fsize = output_path.stat().st_size / 1e6
+    fp32_size = input_path.stat().st_size / 1e6
+    log(f"    {fsize:.1f}MB (was {fp32_size:.1f}MB, "
+        f"{fsize/fp32_size*100:.0f}%)")
+
+
 class _NumpyCalibrationReader:
     """Feeds pre-computed numpy arrays to onnxruntime static quantization."""
 
@@ -997,7 +1027,8 @@ def export_triposr_fp32(wrapper: nn.Module, output_path: Path, opset: int = 15,
 def export_triposr_variant(model: TSR, out_dir: Path, prefix: str, label: str,
                            wrapper_fn, opset: int, static: bool, fp32_only: bool,
                            skip_split: bool, skip_verify: bool,
-                           img_np: np.ndarray, qdq: bool = False) -> list[dict]:
+                           img_np: np.ndarray, qdq: bool = False,
+                           int4: bool = False) -> list[dict]:
     """Export a TripoSR variant (vanilla or ToMe) through the full pipeline.
 
     Split happens BEFORE graph optimization — optimization renames internal
@@ -1015,13 +1046,28 @@ def export_triposr_variant(model: TSR, out_dir: Path, prefix: str, label: str,
         # Split from the unoptimized graph (tensor names intact)
         p1_fp32, p2_fp32 = split_model(fp32_path, out_dir, prefix)
 
-        # Transformer-specific fusions on raw parts (SkipLayerNorm, Gelu).
+        # INT4 must happen BEFORE any optimizer — both transformer_optimize
+        # and optimize_graph convert weight-carrying MatMul ops into Gemm/
+        # FusedMatMul which the INT4 quantizer cannot handle.
+        int4_paths = {}
+        if int4 and not fp32_only:
+            p1_int4 = out_dir / f"{prefix}_part1_int4.onnx"
+            p2_int4 = out_dir / f"{prefix}_part2_int4.onnx"
+            quantize_int4(p1_fp32, p1_int4)
+            quantize_int4(p2_fp32, p2_int4)
+            transformer_optimize(p1_int4)
+            transformer_optimize(p2_int4)
+            optimize_graph(p1_int4)
+            optimize_graph(p2_int4)
+            int4_paths["int4"] = (p1_int4, p2_int4)
+
+        # Transformer-specific fusions on FP32 parts (SkipLayerNorm, Gelu).
         # Must run BEFORE ORT optimize since ORT creates FusedMatMul/etc that
         # block the transformer optimizer's pattern matching.
         transformer_optimize(p1_fp32)
         transformer_optimize(p2_fp32)
 
-        # Then ORT graph optimizations on top
+        # Then ORT graph optimizations on FP32 parts
         optimize_graph(fp32_path)
         optimize_graph(p1_fp32)
         optimize_graph(p2_fp32)
@@ -1035,6 +1081,7 @@ def export_triposr_variant(model: TSR, out_dir: Path, prefix: str, label: str,
         if not fp32_only:
             quant_paths = quantize_split_parts(p1_fp32, p2_fp32, out_dir, prefix,
                                                qdq=qdq)
+            quant_paths.update(int4_paths)
             if not skip_verify:
                 for prec, (p1, p2) in quant_paths.items():
                     results.append(verify_split(
@@ -1282,7 +1329,7 @@ def deploy_to_unity(models_dir: Path, precision: str = "all"):
 
     if precision == "all":
         copies = []
-        for prec in ["fp32", "fp16", "int8"]:
+        for prec in ["fp32", "fp16", "int8", "int4"]:
             for part in ["triposr_part1", "triposr_part2"]:
                 src = models_dir / f"{part}_{prec}.onnx"
                 if src.exists():
@@ -1357,6 +1404,10 @@ def main():
                         help="Also export INT8-QDQ (static quantization) for NPU/QNN HTP")
     parser.add_argument("--qdq-only", action="store_true",
                         help="Only export INT8-QDQ variants (skip FP32/FP16/dynamic INT8 export)")
+    parser.add_argument("--int4", action="store_true",
+                        help="Also export INT4 weight-only quantization (MatMulNBits)")
+    parser.add_argument("--int4-only", action="store_true",
+                        help="Only export INT4 variants from existing FP32 split parts")
     parser.add_argument("--runs", type=int, default=10,
                         help="Benchmark runs (default: 10)")
     parser.add_argument("--output-dir", type=Path, default=MODELS_DIR)
@@ -1364,6 +1415,8 @@ def main():
 
     if args.qdq_only:
         args.qdq = True
+    if args.int4_only:
+        args.int4 = True
 
     if (args.tome is not None or args.tome_only) and not args.experimental:
         parser.error("ToMe export requires --experimental flag")
@@ -1372,6 +1425,62 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     all_results = []
+
+    # ---- INT4-only: re-export FP32 → split → transformer optimize → INT4 ----
+    # Must apply INT4 BEFORE ORT graph optimization, because optimize_graph
+    # converts weight-carrying MatMul+Add into Gemm ops which the INT4
+    # quantizer cannot handle (it only supports MatMul → MatMulNBits).
+    if args.int4_only:
+        _print_section("INT4-ONLY: Weight-only INT4 quantization")
+
+        log("  Loading teacher model...")
+        teacher = load_teacher("cpu")
+        img_np = get_dummy_image("cpu").numpy()
+        ref_out = TripoSRForward(teacher)(torch.from_numpy(img_np)).detach().numpy()
+
+        # Export a raw (unoptimized) FP32 for INT4 pipeline — existing
+        # triposr_fp32.onnx may already have Gemm/FusedMatMul from optimize_graph.
+        raw_fp32 = out_dir / "triposr_fp32_raw_int4.onnx"
+        log("  Exporting raw FP32 for INT4...")
+        export_triposr_fp32(TripoSRForward(teacher), raw_fp32,
+                            args.opset, "Raw FP32 for INT4", static=True)
+
+        # Split using a temp prefix to avoid overwriting existing optimized FP32 parts
+        raw_p1, raw_p2 = split_model(raw_fp32, out_dir, "triposr_raw_int4")
+        raw_fp32.unlink(missing_ok=True)
+
+        # INT4 quantize BEFORE any optimizer (all linear layers are still MatMul)
+        p1_int4 = out_dir / "triposr_part1_int4.onnx"
+        p2_int4 = out_dir / "triposr_part2_int4.onnx"
+        quantize_int4(raw_p1, p1_int4)
+        quantize_int4(raw_p2, p2_int4)
+
+        # Clean up raw intermediates
+        raw_p1.unlink(missing_ok=True)
+        raw_p2.unlink(missing_ok=True)
+
+        # Transformer fusions + ORT graph optimization on INT4 models
+        transformer_optimize(p1_int4)
+        transformer_optimize(p2_int4)
+        optimize_graph(p1_int4)
+        optimize_graph(p2_int4)
+
+        if not args.skip_verify:
+            all_results.append(verify_split(
+                p1_int4, p2_int4, ref_out, img_np, "Vanilla Split INT4"))
+
+        if all_results:
+            _print_section("ACCURACY & SIZE SUMMARY")
+            log(f"{'Variant':<35} {'Size':>8} {'Max Err%':>10} {'Mean Err%':>10}")
+            log("-" * 65)
+            for r in all_results:
+                log(f"{r['label']:<35} {r['size_mb']:>7.1f}MB "
+                    f"{r['max_rel']*100:>9.4f}% {r['mean_rel']*100:>9.4f}%")
+
+        if args.deploy:
+            deploy_to_unity(out_dir, args.deploy)
+        log("\nDone!")
+        return
 
     # ---- QDQ-only: quantize from existing FP32 models, no re-export ----
     if args.qdq_only:
@@ -1473,7 +1582,7 @@ def main():
                     opset=args.opset, static=not args.dynamic,
                     fp32_only=args.fp32_only, skip_split=args.skip_split,
                     skip_verify=args.skip_verify, img_np=img_np,
-                    qdq=args.qdq,
+                    qdq=args.qdq, int4=args.int4,
                 ))
 
             if args.tome is not None:
@@ -1486,7 +1595,7 @@ def main():
                     opset=args.opset, static=not args.dynamic,
                     fp32_only=args.fp32_only, skip_split=args.skip_split,
                     skip_verify=args.skip_verify, img_np=img_np,
-                    qdq=args.qdq,
+                    qdq=args.qdq, int4=args.int4,
                 ))
 
         # ---- NeRF Decoder ----

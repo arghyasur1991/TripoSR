@@ -112,7 +112,8 @@ def measure_quality(mesh: trimesh.Trimesh, baseline_mesh: trimesh.Trimesh) -> di
 
 def run_experiment(model: TSR, device: str, config_name: str, config: dict,
                    baseline_times: dict, baseline_meshes: dict,
-                   speed_only: bool = False) -> dict:
+                   speed_only: bool = False,
+                   save_meshes: Path = None) -> dict:
     """Run a single ToMe configuration and return results."""
     r = config["r"]
     layers = config["layers"]
@@ -150,6 +151,12 @@ def run_experiment(model: TSR, device: str, config_name: str, config: dict,
             status = "PASS" if q["cd"] < 2.0 and q["f1"] > 85.0 else "FAIL"
             print(f"  {name}: CD={q['cd']:.3f}% F@1%={q['f1']:.1f} F@2%={q['f2']:.1f} [{status}]")
 
+            if save_meshes:
+                out_dir = save_meshes / config_name
+                out_dir.mkdir(parents=True, exist_ok=True)
+                mesh.export(str(out_dir / f"{name}.obj"))
+                print(f"    -> saved {out_dir / f'{name}.obj'}")
+
         avg_cd = np.mean([v["cd"] for v in qualities.values()])
         avg_f1 = np.mean([v["f1"] for v in qualities.values()])
         print(f"  AVG quality: CD={avg_cd:.3f}% F@1%={avg_f1:.1f}")
@@ -174,7 +181,11 @@ def main():
                         help="Which configs to run (default: all)")
     parser.add_argument("--speed-only", action="store_true",
                         help="Skip quality measurement (mesh extraction)")
+    parser.add_argument("--save-meshes", action="store_true",
+                        help="Save OBJ meshes to output/tome_meshes/")
     args = parser.parse_args()
+
+    mesh_dir = Path("output/tome_meshes") if args.save_meshes else None
 
     device = "cuda" if torch.cuda.is_available() else (
         "mps" if torch.backends.mps.is_available() else "cpu"
@@ -205,6 +216,12 @@ def main():
             baseline_meshes[name] = extract_mesh(model, scene_codes)
             print(f"    {name}: {baseline_meshes[name].vertices.shape[0]} verts")
 
+            if mesh_dir:
+                bl_dir = mesh_dir / "baseline"
+                bl_dir.mkdir(parents=True, exist_ok=True)
+                baseline_meshes[name].export(str(bl_dir / f"{name}.obj"))
+                print(f"      -> saved {bl_dir / f'{name}.obj'}")
+
     # Run experiments
     results = []
     for config_name in args.configs:
@@ -213,7 +230,8 @@ def main():
             continue
         result = run_experiment(
             model, device, config_name, CONFIGS[config_name],
-            baseline_times, baseline_meshes, args.speed_only
+            baseline_times, baseline_meshes, args.speed_only,
+            save_meshes=mesh_dir,
         )
         results.append(result)
 

@@ -1002,6 +1002,12 @@ def main():
                 if all(p.exists() for p in [p1_qdq, p2_qdq, dec_fp32]):
                     e2e_variants.append(("e2e_split_int8_qdq_fp32dec", rembg_path, p1_qdq, p2_qdq, dec_fp32))
 
+                # INT4 split pipeline (weight-only INT4 MatMulNBits)
+                p1_int4 = models_dir / "triposr_part1_int4.onnx"
+                p2_int4 = models_dir / "triposr_part2_int4.onnx"
+                if all(p.exists() for p in [p1_int4, p2_int4, dec_fp32]):
+                    e2e_variants.append(("e2e_split_int4", rembg_path, p1_int4, p2_int4, dec_fp32))
+
                 # Full (unsplit) FP32 for reference
                 triposr_full = models_dir / "triposr_fp32.onnx"
                 if all(p.exists() for p in [triposr_full, dec_fp32]):
