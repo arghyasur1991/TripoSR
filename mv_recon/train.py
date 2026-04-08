@@ -66,7 +66,7 @@ OVERFIT_11_UIDS = [
 
 def compute_loss(model: MVReconModel, batch: dict,
                  device: torch.device) -> tuple[torch.Tensor, dict]:
-    """Direct 3D occupancy supervision via per-voxel BCE."""
+    """Direct 3D occupancy supervision via per-voxel BCE with class balancing."""
     input_imgs = batch['input_images'].to(device)
     input_c2w = batch['input_c2w'].to(device)
     gt_occ = batch['gt_occupancy'].to(device)      # [B, D, D, D]
@@ -74,7 +74,14 @@ def compute_loss(model: MVReconModel, batch: dict,
     density = model(input_imgs, input_c2w)           # [B, 1, D, D, D]
     pred_logits = density[:, 0]                      # [B, D, D, D]
 
-    loss = F.binary_cross_entropy_with_logits(pred_logits, gt_occ)
+    n_pos = gt_occ.sum().clamp(min=1.0)
+    n_neg = (1 - gt_occ).sum().clamp(min=1.0)
+    pos_weight = (n_neg / n_pos).clamp(max=20.0)
+
+    loss = F.binary_cross_entropy_with_logits(
+        pred_logits, gt_occ,
+        pos_weight=pos_weight,
+    )
 
     with torch.no_grad():
         pred_occ = torch.sigmoid(pred_logits)
