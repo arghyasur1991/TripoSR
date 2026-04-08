@@ -23,8 +23,7 @@ from .camera_utils import (
     BLENDER_RENDER_W,
     BLENDER_RENDER_H,
 )
-from .renderer import render_volume
-from .train import RENDERS_DIR, ALL_18_UIDS, OVERFIT_11_UIDS
+from .train import RENDERS_DIR, VOXELS_DIR, ALL_18_UIDS, OVERFIT_11_UIDS
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406])
 IMAGENET_STD = np.array([0.229, 0.224, 0.225])
@@ -172,34 +171,20 @@ def save_input_views(dataset: ObjaverseMultiViewDataset, idx: int,
         Image.fromarray(img).save(out_dir / f'input_view_{v}.png')
 
 
-def render_supervision_views(model: MVReconModel, dataset: ObjaverseMultiViewDataset,
-                             idx: int, device: torch.device, out_dir: Path,
-                             K_sup: torch.Tensor, n_views: int = 4):
-    """Render the model's output from supervision viewpoints for comparison."""
-    item = dataset[idx]
-    input_imgs = item['input_images'].unsqueeze(0).to(device)
-    input_c2w = item['input_c2w'].unsqueeze(0).to(device)
-
-    with torch.no_grad():
-        density, color = model(input_imgs, input_c2w)
-
-    density_vol = density[0]
-    color_vol = color[0]
-
-    for v in range(min(n_views, item['sup_c2w'].shape[0])):
-        c2w = item['sup_c2w'][v].to(device)
-        rgb, mask = render_volume(
-            density_vol, color_vol, c2w, K_sup,
-            render_h=128, render_w=128, n_samples=96,
-        )
-        rgb_composited = rgb * mask.unsqueeze(-1) + 0.5 * (1.0 - mask.unsqueeze(-1))
-        rgb_np = rgb_composited.cpu().clamp(0, 1).numpy()
-        img = (rgb_np * 255).astype(np.uint8)
-        Image.fromarray(img).save(out_dir / f'render_sup_{v}.png')
-
-        gt = item['sup_images'][v].permute(1, 2, 0).numpy()
-        gt = (gt * 255).astype(np.uint8)
-        Image.fromarray(gt).save(out_dir / f'gt_sup_{v}.png')
+def save_gt_mesh(uid: str, out_dir: Path, volume_size: int = 64,
+                 voxel_range: float = 0.55):
+    """Extract GT mesh from voxelized ground truth for comparison."""
+    voxel_path = Path(VOXELS_DIR) / f"{uid}.npy"
+    if not voxel_path.exists():
+        return
+    gt_occ = np.load(voxel_path)
+    try:
+        verts, faces, _ = marching_cubes_extract(gt_occ, threshold=0.5,
+                                                 voxel_range=voxel_range)
+        colors = np.full((len(verts), 3), 0.7)
+        save_obj_with_colors(str(out_dir / 'gt_mesh.obj'), verts, faces, colors)
+    except Exception as e:
+        print(f"  GT mesh extraction failed: {e}")
 
 
 def extract(args):
@@ -215,6 +200,7 @@ def extract(args):
         n_input_views=args.n_input_views,
         n_sup_views=8,
         image_size=args.image_size,
+        voxels_dir=VOXELS_DIR,
     )
 
     model = MVReconModel(
@@ -235,9 +221,6 @@ def extract(args):
     K_input = adjust_intrinsics_for_crop_resize(
         K_orig, BLENDER_RENDER_W, BLENDER_RENDER_H, args.image_size
     ).numpy()
-    K_sup = adjust_intrinsics_for_crop_resize(
-        K_orig, BLENDER_RENDER_W, BLENDER_RENDER_H, 128
-    ).to(device)
 
     ckpt_path = Path(args.checkpoint)
     if ckpt_path.parent.name == 'checkpoints':
@@ -258,7 +241,7 @@ def extract(args):
         input_c2w = item['input_c2w'].unsqueeze(0).to(device)
 
         with torch.no_grad():
-            density, color = model(input_imgs, input_c2w)
+            density = model(input_imgs, input_c2w)
 
         occ = torch.sigmoid(density[0, 0]).cpu().numpy()
 
@@ -287,7 +270,7 @@ def extract(args):
         save_obj_with_colors(str(obj_out / 'mesh.obj'), verts, faces, vcols)
 
         save_input_views(dataset, idx, obj_out, n_views=4)
-        render_supervision_views(model, dataset, idx, device, obj_out, K_sup, n_views=4)
+        save_gt_mesh(uid, obj_out, volume_size=args.volume_size)
 
         print(f"  Saved to {obj_out}")
 

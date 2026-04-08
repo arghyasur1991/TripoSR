@@ -188,30 +188,21 @@ class Refiner3D(nn.Module):
         return self.proj_out(h) + x
 
 
-class OccupancyColorHead(nn.Module):
-    """Predicts density (1ch) and color (3ch) per voxel."""
+class OccupancyHead(nn.Module):
+    """Predicts occupancy logits (1ch) per voxel."""
 
     def __init__(self, in_channels: int = 64):
         super().__init__()
-        density_out = nn.Conv3d(32, 1, 1)
-        # Bias toward empty space: initial sigmoid(output) ≈ sigmoid(-3) ≈ 0.05
-        nn.init.constant_(density_out.bias, -3.0)
-        self.density_net = nn.Sequential(
+        out = nn.Conv3d(32, 1, 1)
+        nn.init.constant_(out.bias, -3.0)
+        self.net = nn.Sequential(
             nn.Conv3d(in_channels, 32, 1),
             nn.GELU(),
-            density_out,
-        )
-        self.color_net = nn.Sequential(
-            nn.Conv3d(in_channels, 32, 1),
-            nn.GELU(),
-            nn.Conv3d(32, 3, 1),
-            nn.Sigmoid(),
+            out,
         )
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        density = self.density_net(x)
-        color = self.color_net(x)
-        return density, color
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
 class MVReconModel(nn.Module):
@@ -226,18 +217,17 @@ class MVReconModel(nn.Module):
             volume_size=volume_size, input_size=input_size
         )
         self.refiner = Refiner3D(in_channels=feat_channels)
-        self.head = OccupancyColorHead(in_channels=feat_channels)
+        self.head = OccupancyHead(in_channels=feat_channels)
 
     def forward(self, images: torch.Tensor,
-                c2w_matrices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                c2w_matrices: torch.Tensor) -> torch.Tensor:
         """
         Args:
             images: [B, N, 3, H, W] input views (ImageNet-normalized)
             c2w_matrices: [B, N, 4, 4] Blender camera-to-world matrices
 
         Returns:
-            density: [B, 1, D, D, D] raw density logits
-            color: [B, 3, D, D, D] RGB in [0, 1]
+            density: [B, 1, D, D, D] occupancy logits
         """
         B, N, C, H, W = images.shape
 
@@ -249,8 +239,7 @@ class MVReconModel(nn.Module):
 
         volume = self.unprojector(feats, c2w_matrices)
         volume = self.refiner(volume)
-        density, color = self.head(volume)
-        return density, color
+        return self.head(volume)
 
     def param_count(self) -> dict:
         counts = {}

@@ -8,6 +8,7 @@ import json
 import random
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -28,13 +29,14 @@ class ObjaverseMultiViewDataset(Dataset):
         - sup_images: [N_sup, 3, H, W] (raw [0,1] RGB for loss)
         - sup_masks: [N_sup, H, W] alpha masks
         - sup_c2w: [N_sup, 4, 4] supervision camera matrices
+        - gt_occupancy: [D, D, D] binary occupancy grid (if voxels_dir provided)
         - uid: object UID string
     """
 
     def __init__(self, renders_dir: str, uids: list[str],
                  n_input_views: int = 4, n_sup_views: int = 8,
                  image_size: int = 160, sup_image_size: int = 128,
-                 augment: bool = False):
+                 augment: bool = False, voxels_dir: str | None = None):
         self.renders_dir = Path(renders_dir)
         self.uids = uids
         self.n_input_views = n_input_views
@@ -42,6 +44,7 @@ class ObjaverseMultiViewDataset(Dataset):
         self.image_size = image_size
         self.sup_image_size = sup_image_size
         self.augment = augment
+        self.voxels_dir = Path(voxels_dir) if voxels_dir else None
 
         self.input_transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
@@ -142,7 +145,7 @@ class ObjaverseMultiViewDataset(Dataset):
             sup_masks.append(mask_tensor.squeeze(0))
             sup_c2w.append(torch.tensor(cams[i]['pose'], dtype=torch.float32))
 
-        return {
+        result = {
             'input_images': torch.stack(input_images),         # [N_in, 3, H, W]
             'input_c2w': torch.stack(input_c2w),               # [N_in, 4, 4]
             'sup_images': torch.stack(sup_images),             # [N_sup, 3, H, W]
@@ -150,3 +153,11 @@ class ObjaverseMultiViewDataset(Dataset):
             'sup_c2w': torch.stack(sup_c2w),                   # [N_sup, 4, 4]
             'uid': obj['uid'],
         }
+
+        if self.voxels_dir is not None:
+            voxel_path = self.voxels_dir / f"{obj['uid']}.npy"
+            if voxel_path.exists():
+                gt_occ = np.load(voxel_path)
+                result['gt_occupancy'] = torch.from_numpy(gt_occ)
+
+        return result

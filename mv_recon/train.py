@@ -19,17 +19,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from .model import MVReconModel
-from .renderer import render_rays_batch
 from .dataset import ObjaverseMultiViewDataset
-from .camera_utils import (
-    blender_intrinsics,
-    adjust_intrinsics_for_crop_resize,
-    BLENDER_RENDER_W,
-    BLENDER_RENDER_H,
-)
 
 
 RENDERS_DIR = "/Users/sur/Downloads/mv_recon_data/renders"
+VOXELS_DIR = "/Users/sur/Downloads/mv_recon_data/voxels"
 
 ALL_18_UIDS = [
     "0bdb81c409e44805b97ad0154c562eeb",
@@ -71,49 +65,29 @@ OVERFIT_11_UIDS = [
 
 
 def compute_loss(model: MVReconModel, batch: dict,
-                 K_sup: torch.Tensor, device: torch.device,
-                 n_samples: int = 64, n_rays_per_view: int = 512,
-                 sup_size: int = 64) -> tuple[torch.Tensor, dict]:
-    """Compute rendering-based training loss using random ray sampling."""
+                 device: torch.device) -> tuple[torch.Tensor, dict]:
+    """Direct 3D occupancy supervision via per-voxel BCE."""
     input_imgs = batch['input_images'].to(device)
     input_c2w = batch['input_c2w'].to(device)
-    sup_imgs = batch['sup_images'].to(device)
-    sup_masks = batch['sup_masks'].to(device)
-    sup_c2w = batch['sup_c2w'].to(device)
+    gt_occ = batch['gt_occupancy'].to(device)      # [B, D, D, D]
 
-    density, color = model(input_imgs, input_c2w)
+    density = model(input_imgs, input_c2w)           # [B, 1, D, D, D]
+    pred_logits = density[:, 0]                      # [B, D, D, D]
 
-    density_vol = density[0]  # [1, D, D, D]
-    color_vol = color[0]      # [3, D, D, D]
+    loss = F.binary_cross_entropy_with_logits(pred_logits, gt_occ)
 
-    rgb_pred, rgb_gt, mask_pred, mask_gt = render_rays_batch(
-        density_vol, color_vol,
-        sup_c2w[0], K_sup,
-        sup_imgs[0], sup_masks[0],
-        render_h=sup_size, render_w=sup_size,
-        n_samples=n_samples,
-        n_rays_per_view=n_rays_per_view,
-    )
+    with torch.no_grad():
+        pred_occ = torch.sigmoid(pred_logits)
+        iou = _iou(pred_occ > 0.5, gt_occ > 0.5)
 
-    rgb_loss = F.mse_loss(rgb_pred, rgb_gt)
-    mask_loss = F.binary_cross_entropy(
-        mask_pred.clamp(1e-6, 1 - 1e-6),
-        mask_gt.clamp(0, 1)
-    )
+    return loss, {'loss': loss.item(), 'iou': iou.item()}
 
-    occ = torch.sigmoid(density_vol)
-    entropy = -(occ * torch.log(occ + 1e-6) + (1 - occ) * torch.log(1 - occ + 1e-6))
-    entropy_loss = entropy.mean()
 
-    loss = rgb_loss + 0.1 * mask_loss + 0.01 * entropy_loss
-
-    metrics = {
-        'loss': loss.item(),
-        'rgb_loss': rgb_loss.item(),
-        'mask_loss': mask_loss.item(),
-        'entropy_loss': entropy_loss.item(),
-    }
-    return loss, metrics
+def _iou(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    """Intersection-over-union for binary occupancy volumes."""
+    intersection = (pred & gt).float().sum()
+    union = (pred | gt).float().sum()
+    return intersection / union.clamp(min=1.0)
 
 
 def train(args):
@@ -132,6 +106,7 @@ def train(args):
         n_sup_views=args.n_sup_views,
         image_size=args.image_size,
         sup_image_size=args.sup_image_size,
+        voxels_dir=VOXELS_DIR,
     )
     print(f"Dataset: {len(dataset)} objects loaded")
     loader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=0)
@@ -146,10 +121,6 @@ def train(args):
     print("Parameters:")
     for k, v in counts.items():
         print(f"  {k}: {v:,} ({v / 1e6:.1f}M)")
-
-    K_sup = adjust_intrinsics_for_crop_resize(
-        blender_intrinsics(), BLENDER_RENDER_W, BLENDER_RENDER_H, args.sup_image_size
-    ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -208,12 +179,7 @@ def train(args):
 
         for batch in loader:
             optimizer.zero_grad()
-            loss, metrics = compute_loss(
-                model, batch, K_sup, device,
-                n_samples=args.n_samples,
-                n_rays_per_view=args.n_rays_per_view,
-                sup_size=args.sup_image_size,
-            )
+            loss, metrics = compute_loss(model, batch, device)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -237,9 +203,7 @@ def train(args):
         if epoch % args.log_every == 0 or epoch == 1:
             print(f"[Epoch {epoch:4d}/{args.epochs}] "
                   f"loss={avg_loss:.4f} "
-                  f"rgb={avg_metrics.get('rgb_loss', 0):.4f} "
-                  f"mask={avg_metrics.get('mask_loss', 0):.4f} "
-                  f"ent={avg_metrics.get('entropy_loss', 0):.4f} "
+                  f"iou={avg_metrics.get('iou', 0):.4f} "
                   f"lr={scheduler.get_last_lr()[0]:.2e} "
                   f"({epoch_time:.1f}s)")
 
@@ -275,8 +239,6 @@ def main():
     parser.add_argument('--sup_image_size', type=int, default=64)
     parser.add_argument('--n_input_views', type=int, default=4)
     parser.add_argument('--n_sup_views', type=int, default=4)
-    parser.add_argument('--n_samples', type=int, default=64)
-    parser.add_argument('--n_rays_per_view', type=int, default=512)
     parser.add_argument('--output_dir', type=str, default='output/mv_recon_overfit')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
