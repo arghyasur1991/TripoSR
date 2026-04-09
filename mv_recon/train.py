@@ -1,5 +1,7 @@
 """Training script for multi-view reconstruction model.
 
+Hybrid loss: photometric (projected colors) + mask + 3D BCE.
+
 Usage:
     # Overfit on 11 objects (PoC):
     python -m mv_recon.train --mode overfit --epochs 500
@@ -20,6 +22,13 @@ from torch.utils.data import DataLoader
 
 from .model import MVReconModel
 from .dataset import ObjaverseMultiViewDataset
+from .renderer import render_rays_batch
+from .camera_utils import (
+    blender_intrinsics,
+    adjust_intrinsics_for_crop_resize,
+    BLENDER_RENDER_W,
+    BLENDER_RENDER_H,
+)
 
 
 RENDERS_DIR = "/Users/sur/Downloads/mv_recon_data/renders"
@@ -65,29 +74,85 @@ OVERFIT_11_UIDS = [
 
 
 def compute_loss(model: MVReconModel, batch: dict,
-                 device: torch.device) -> tuple[torch.Tensor, dict]:
-    """Direct 3D occupancy supervision via per-voxel BCE with class balancing."""
-    input_imgs = batch['input_images'].to(device)
-    input_c2w = batch['input_c2w'].to(device)
-    gt_occ = batch['gt_occupancy'].to(device)      # [B, D, D, D]
+                 device: torch.device,
+                 K_sup: torch.Tensor,
+                 n_samples: int = 64, n_rays_per_view: int = 512,
+                 sup_image_size: int = 64,
+                 w_photo: float = 1.0, w_mask: float = 0.1,
+                 w_bce: float = 0.5,
+                 ) -> tuple[torch.Tensor, dict]:
+    """Hybrid loss: photometric + mask (rendering) + 3D BCE (direct voxel).
 
-    density = model(input_imgs, input_c2w)           # [B, 1, D, D, D]
-    pred_logits = density[:, 0]                      # [B, D, D, D]
+    Photometric and mask losses use the learned color volume for gradients.
+    3D BCE loss provides direct geometry supervision from GT voxels.
+    """
+    input_imgs = batch['input_images'].to(device)    # [B, V_in, 3, H, W]
+    input_c2w = batch['input_c2w'].to(device)        # [B, V_in, 4, 4]
+    sup_imgs = batch['sup_images'].to(device)        # [B, V_sup, 3, H, W]
+    sup_masks = batch['sup_masks'].to(device)        # [B, V_sup, H, W]
+    sup_c2w = batch['sup_c2w'].to(device)            # [B, V_sup, 4, 4]
 
-    n_pos = gt_occ.sum().clamp(min=1.0)
-    n_neg = (1 - gt_occ).sum().clamp(min=1.0)
-    pos_weight = (n_neg / n_pos).clamp(max=20.0)
+    density, color = model(input_imgs, input_c2w)    # [B,1,D,D,D], [B,3,D,D,D]
 
-    loss = F.binary_cross_entropy_with_logits(
-        pred_logits, gt_occ,
-        pos_weight=pos_weight,
-    )
+    # Rendering-based losses (per batch element, B=1 expected)
+    total_photo = torch.tensor(0.0, device=device)
+    total_mask = torch.tensor(0.0, device=device)
+    B = density.shape[0]
+    for b in range(B):
+        rgb_pred, rgb_gt, mask_pred, mask_gt = render_rays_batch(
+            density_vol=density[b, 0],   # [D, D, D]
+            color_vol=color[b],          # [3, D, D, D]
+            sup_c2w=sup_c2w[b],
+            K_sup=K_sup,
+            gt_rgbs=sup_imgs[b],
+            gt_masks=sup_masks[b],
+            render_h=sup_image_size, render_w=sup_image_size,
+            n_samples=n_samples, n_rays_per_view=n_rays_per_view,
+        )
+        total_photo += F.mse_loss(rgb_pred, rgb_gt)
+        total_mask += F.binary_cross_entropy(
+            mask_pred.clamp(1e-5, 1 - 1e-5), mask_gt,
+        )
+    photo_loss = total_photo / B
+    mask_loss = total_mask / B
 
-    with torch.no_grad():
-        pred_occ = torch.sigmoid(pred_logits)
-        iou = _iou(pred_occ > 0.5, gt_occ > 0.5)
+    # Direct 3D BCE loss (if GT voxels available)
+    bce_loss = torch.tensor(0.0, device=device)
+    iou_val = 0.0
+    if 'gt_occupancy' in batch:
+        gt_occ = batch['gt_occupancy'].to(device)  # [B, D_gt, D_gt, D_gt]
+        pred_logits = density[:, 0]                 # [B, D, D, D]
 
-    return loss, {'loss': loss.item(), 'iou': iou.item()}
+        D_pred = pred_logits.shape[-1]
+        D_gt = gt_occ.shape[-1]
+        if D_gt != D_pred:
+            gt_occ = F.interpolate(
+                gt_occ.unsqueeze(1).float(),
+                size=(D_pred, D_pred, D_pred),
+                mode='nearest',
+            ).squeeze(1)
+            gt_occ = (gt_occ > 0.5).float()
+
+        n_pos = gt_occ.sum().clamp(min=1.0)
+        n_neg = (1 - gt_occ).sum().clamp(min=1.0)
+        pos_weight = (n_neg / n_pos).clamp(max=20.0)
+
+        bce_loss = F.binary_cross_entropy_with_logits(
+            pred_logits, gt_occ, pos_weight=pos_weight,
+        )
+        with torch.no_grad():
+            iou_val = _iou(torch.sigmoid(pred_logits) > 0.5,
+                           gt_occ > 0.5).item()
+
+    loss = w_photo * photo_loss + w_mask * mask_loss + w_bce * bce_loss
+
+    return loss, {
+        'loss': loss.item(),
+        'photo': photo_loss.item(),
+        'mask': mask_loss.item(),
+        'bce': bce_loss.item(),
+        'iou': iou_val,
+    }
 
 
 def _iou(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
@@ -128,6 +193,11 @@ def train(args):
     print("Parameters:")
     for k, v in counts.items():
         print(f"  {k}: {v:,} ({v / 1e6:.1f}M)")
+
+    K_orig = blender_intrinsics()
+    K_sup = adjust_intrinsics_for_crop_resize(
+        K_orig, BLENDER_RENDER_W, BLENDER_RENDER_H, args.sup_image_size
+    ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -186,7 +256,13 @@ def train(args):
 
         for batch in loader:
             optimizer.zero_grad()
-            loss, metrics = compute_loss(model, batch, device)
+            loss, metrics = compute_loss(
+                model, batch, device,
+                K_sup=K_sup,
+                n_samples=args.n_samples,
+                n_rays_per_view=args.n_rays_per_view,
+                sup_image_size=args.sup_image_size,
+            )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -210,6 +286,9 @@ def train(args):
         if epoch % args.log_every == 0 or epoch == 1:
             print(f"[Epoch {epoch:4d}/{args.epochs}] "
                   f"loss={avg_loss:.4f} "
+                  f"photo={avg_metrics.get('photo', 0):.4f} "
+                  f"mask={avg_metrics.get('mask', 0):.4f} "
+                  f"bce={avg_metrics.get('bce', 0):.4f} "
                   f"iou={avg_metrics.get('iou', 0):.4f} "
                   f"lr={scheduler.get_last_lr()[0]:.2e} "
                   f"({epoch_time:.1f}s)")
@@ -246,6 +325,8 @@ def main():
     parser.add_argument('--sup_image_size', type=int, default=64)
     parser.add_argument('--n_input_views', type=int, default=4)
     parser.add_argument('--n_sup_views', type=int, default=4)
+    parser.add_argument('--n_samples', type=int, default=64)
+    parser.add_argument('--n_rays_per_view', type=int, default=1024)
     parser.add_argument('--output_dir', type=str, default='output/mv_recon_overfit')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')

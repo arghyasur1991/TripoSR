@@ -2,6 +2,7 @@
 
 Loads a checkpoint, runs inference on each object, extracts meshes via
 marching cubes, and projects input view textures onto vertices.
+Also renders silhouette images for visual comparison.
 
 Usage:
     python -m mv_recon.extract_mesh --checkpoint output/mv_recon_overfit/checkpoints/best.pt --mode overfit
@@ -17,6 +18,7 @@ from PIL import Image
 
 from .model import MVReconModel
 from .dataset import ObjaverseMultiViewDataset
+from .renderer import render_volume
 from .camera_utils import (
     blender_intrinsics,
     adjust_intrinsics_for_crop_resize,
@@ -221,6 +223,9 @@ def extract(args):
     K_input = adjust_intrinsics_for_crop_resize(
         K_orig, BLENDER_RENDER_W, BLENDER_RENDER_H, args.image_size
     ).numpy()
+    K_render = adjust_intrinsics_for_crop_resize(
+        K_orig, BLENDER_RENDER_W, BLENDER_RENDER_H, 128
+    ).to(device)
 
     ckpt_path = Path(args.checkpoint)
     if ckpt_path.parent.name == 'checkpoints':
@@ -241,7 +246,7 @@ def extract(args):
         input_c2w = item['input_c2w'].unsqueeze(0).to(device)
 
         with torch.no_grad():
-            density = model(input_imgs, input_c2w)
+            density, color = model(input_imgs, input_c2w)
 
         occ = torch.sigmoid(density[0, 0]).cpu().numpy()
 
@@ -260,17 +265,43 @@ def extract(args):
 
         input_c2w_np = item['input_c2w'].numpy()  # [V, 4, 4]
 
-        vcols = project_vertex_colors(
+        # Color from learned color volume
+        verts_t = torch.from_numpy(verts).float().to(device)
+        with torch.no_grad():
+            from .renderer import _sample_volume
+            vcols_vol = torch.sigmoid(
+                _sample_volume(color[0], verts_t)
+            ).cpu().numpy()  # [N, 3]
+        save_obj_with_colors(str(obj_out / 'mesh.obj'), verts, faces, vcols_vol)
+
+        # Also save with projected texture for comparison
+        vcols_proj = project_vertex_colors(
             verts, normals, input_imgs_raw, input_c2w_np,
             K_input, args.image_size,
         )
-        n_colored = (vcols.max(axis=1) - vcols.min(axis=1) > 0.02).sum()
+        save_obj_with_colors(str(obj_out / 'mesh_projected.obj'), verts, faces, vcols_proj)
+        n_colored = (vcols_proj.max(axis=1) - vcols_proj.min(axis=1) > 0.02).sum()
         print(f"  Texture: {n_colored}/{len(verts)} vertices colored from views")
-
-        save_obj_with_colors(str(obj_out / 'mesh.obj'), verts, faces, vcols)
 
         save_input_views(dataset, idx, obj_out, n_views=4)
         save_gt_mesh(uid, obj_out, volume_size=args.volume_size)
+
+        # Render from supervision views (with learned colors)
+        sup_c2w = item['sup_c2w'].to(device)
+        for sv in range(min(4, sup_c2w.shape[0])):
+            with torch.no_grad():
+                rgb_img, mask_img = render_volume(
+                    density[0, 0], sup_c2w[sv], K_render,
+                    render_h=128, render_w=128, n_samples=96,
+                    color_vol=color[0],
+                )
+            img_np = (rgb_img.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            Image.fromarray(img_np).save(obj_out / f'render_sup_{sv}.png')
+
+            # Save GT supervision image for comparison
+            gt_img = item['sup_images'][sv].numpy().transpose(1, 2, 0)
+            gt_img = (gt_img * 255).clip(0, 255).astype(np.uint8)
+            Image.fromarray(gt_img).save(obj_out / f'gt_sup_{sv}.png')
 
         print(f"  Saved to {obj_out}")
 

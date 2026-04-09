@@ -188,25 +188,37 @@ class Refiner3D(nn.Module):
         return self.proj_out(h) + x
 
 
-class OccupancyHead(nn.Module):
-    """Predicts occupancy logits (1ch) per voxel."""
+class OccupancyColorHead(nn.Module):
+    """Predicts occupancy logits (1ch) + color logits (3ch) per voxel.
+
+    Separate lightweight branches from the shared feature volume.
+    Density bias initialized to -5.0 (mostly empty at start).
+    """
 
     def __init__(self, in_channels: int = 64):
         super().__init__()
-        out = nn.Conv3d(32, 1, 1)
-        nn.init.constant_(out.bias, -3.0)
-        self.net = nn.Sequential(
+        density_out = nn.Conv3d(32, 1, 1)
+        nn.init.constant_(density_out.bias, -5.0)
+        self.density_branch = nn.Sequential(
             nn.Conv3d(in_channels, 32, 1),
             nn.GELU(),
-            out,
+            density_out,
+        )
+        self.color_branch = nn.Sequential(
+            nn.Conv3d(in_channels, 32, 1),
+            nn.GELU(),
+            nn.Conv3d(32, 3, 1),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.density_branch(x), self.color_branch(x)
 
 
 class MVReconModel(nn.Module):
-    """Full multi-view reconstruction model."""
+    """Full multi-view reconstruction model.
+
+    Returns density [B, 1, D, D, D] and color [B, 3, D, D, D] logits.
+    """
 
     def __init__(self, volume_size: int = 32, feat_channels: int = 128,
                  input_size: int = 160):
@@ -217,10 +229,11 @@ class MVReconModel(nn.Module):
             volume_size=volume_size, input_size=input_size
         )
         self.refiner = Refiner3D(in_channels=feat_channels)
-        self.head = OccupancyHead(in_channels=feat_channels)
+        self.head = OccupancyColorHead(in_channels=feat_channels)
 
     def forward(self, images: torch.Tensor,
-                c2w_matrices: torch.Tensor) -> torch.Tensor:
+                c2w_matrices: torch.Tensor
+                ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             images: [B, N, 3, H, W] input views (ImageNet-normalized)
@@ -228,6 +241,7 @@ class MVReconModel(nn.Module):
 
         Returns:
             density: [B, 1, D, D, D] occupancy logits
+            color: [B, 3, D, D, D] color logits (apply sigmoid for RGB)
         """
         B, N, C, H, W = images.shape
 
