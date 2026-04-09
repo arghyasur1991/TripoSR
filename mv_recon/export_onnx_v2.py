@@ -175,6 +175,15 @@ def export_onnx(model: ExportableModel, output_path: str,
         dynamic_axes=None,  # fixed shapes for Quest deployment
     )
 
+    # Ensure all weights are embedded (torch may create .data sidecar)
+    import onnx
+    data_path = Path(str(output_path) + ".data")
+    if data_path.exists():
+        print("Re-saving with embedded weights (removing .data sidecar)...")
+        m = onnx.load(str(output_path), load_external_data=True)
+        onnx.save_model(m, str(output_path), save_as_external_data=False)
+        data_path.unlink()
+
     file_size = Path(output_path).stat().st_size / (1024 * 1024)
     print(f"Exported: {output_path} ({file_size:.1f} MB)")
     return output_path
