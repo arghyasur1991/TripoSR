@@ -33,11 +33,17 @@ IMAGENET_STD = np.array([0.229, 0.224, 0.225])
 
 def marching_cubes_extract(density: np.ndarray,
                            threshold: float = 0.5,
-                           voxel_range: float = 0.55) -> tuple:
+                           voxel_range: float = 0.55,
+                           min_component_ratio: float = 0.05,
+                           ) -> tuple:
     """Extract mesh from occupancy volume via marching cubes.
+
+    Removes small connected components (floating noise fragments).
+    Components smaller than min_component_ratio * largest are discarded.
 
     Returns vertices in (x, y, z) world space, faces, and normals.
     """
+    import trimesh
     from skimage.measure import marching_cubes
 
     verts, faces, normals, _ = marching_cubes(density, level=threshold)
@@ -45,12 +51,27 @@ def marching_cubes_extract(density: np.ndarray,
     D = density.shape[0]
     verts = verts / (D - 1) * (2 * voxel_range) - voxel_range
 
-    # marching_cubes returns verts in array-index order (dim0, dim1, dim2).
-    # Volume layout is [z, y, x], so swap to (x, y, z) world space.
+    # Volume layout is [z, y, x], swap to (x, y, z) world space.
     verts = verts[:, [2, 1, 0]]
     normals = normals[:, [2, 1, 0]]
 
-    return verts, faces, normals
+    # Remove small connected components
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces,
+                           vertex_normals=normals, process=False)
+    components = mesh.split(only_watertight=False)
+    if len(components) > 1:
+        components.sort(key=lambda c: len(c.faces), reverse=True)
+        max_faces = len(components[0].faces)
+        keep = [c for c in components
+                if len(c.faces) >= max_faces * min_component_ratio]
+        if keep:
+            mesh = trimesh.util.concatenate(keep)
+            n_removed = len(components) - len(keep)
+            if n_removed > 0:
+                print(f"  Removed {n_removed} small components "
+                      f"({len(keep)} kept)")
+
+    return mesh.vertices, mesh.faces, mesh.vertex_normals
 
 
 def project_vertex_colors(vertices: np.ndarray, normals: np.ndarray,
@@ -251,7 +272,8 @@ def extract(args):
         occ = torch.sigmoid(density[0, 0]).cpu().numpy()
 
         try:
-            verts, faces, normals = marching_cubes_extract(occ, threshold=0.5)
+            verts, faces, normals = marching_cubes_extract(
+                occ, threshold=args.mc_threshold)
             print(f"  Mesh: {len(verts)} verts, {len(faces)} faces")
         except Exception as e:
             print(f"  Mesh extraction failed: {e}")
@@ -317,6 +339,8 @@ def main():
     parser.add_argument('--image_size', type=int, default=160)
     parser.add_argument('--n_input_views', type=int, default=4)
     parser.add_argument('--output_dir', type=str, default='output/mv_recon_overfit')
+    parser.add_argument('--mc_threshold', type=float, default=0.7,
+                        help='Marching cubes threshold (higher = less noise)')
     args = parser.parse_args()
     extract(args)
 

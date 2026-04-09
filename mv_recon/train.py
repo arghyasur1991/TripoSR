@@ -77,14 +77,15 @@ def compute_loss(model: MVReconModel, batch: dict,
                  device: torch.device,
                  K_sup: torch.Tensor,
                  n_samples: int = 64, n_rays_per_view: int = 512,
-                 sup_image_size: int = 64,
+                 sup_image_size: int = 128,
                  w_photo: float = 1.0, w_mask: float = 0.1,
-                 w_bce: float = 0.5,
+                 w_bce: float = 0.5, w_sparse: float = 0.02,
                  ) -> tuple[torch.Tensor, dict]:
-    """Hybrid loss: photometric + mask (rendering) + 3D BCE (direct voxel).
+    """Hybrid loss: photometric + mask + 3D BCE + sparsity.
 
     Photometric and mask losses use the learned color volume for gradients.
     3D BCE loss provides direct geometry supervision from GT voxels.
+    Sparsity loss penalizes over-prediction of occupied voxels.
     """
     input_imgs = batch['input_images'].to(device)    # [B, V_in, 3, H, W]
     input_c2w = batch['input_c2w'].to(device)        # [B, V_in, 4, 4]
@@ -92,7 +93,7 @@ def compute_loss(model: MVReconModel, batch: dict,
     sup_masks = batch['sup_masks'].to(device)        # [B, V_sup, H, W]
     sup_c2w = batch['sup_c2w'].to(device)            # [B, V_sup, 4, 4]
 
-    density, color = model(input_imgs, input_c2w)    # [B,1,D,D,D], [B,3,D,D,D]
+    density, color = model(input_imgs, input_c2w)    # [B,1,64,64,64], [B,3,64,64,64]
 
     # Rendering-based losses (per batch element, B=1 expected)
     total_photo = torch.tensor(0.0, device=device)
@@ -100,8 +101,8 @@ def compute_loss(model: MVReconModel, batch: dict,
     B = density.shape[0]
     for b in range(B):
         rgb_pred, rgb_gt, mask_pred, mask_gt = render_rays_batch(
-            density_vol=density[b, 0],   # [D, D, D]
-            color_vol=color[b],          # [3, D, D, D]
+            density_vol=density[b, 0],   # [64, 64, 64]
+            color_vol=color[b],          # [3, 64, 64, 64]
             sup_c2w=sup_c2w[b],
             K_sup=K_sup,
             gt_rgbs=sup_imgs[b],
@@ -116,22 +117,12 @@ def compute_loss(model: MVReconModel, batch: dict,
     photo_loss = total_photo / B
     mask_loss = total_mask / B
 
-    # Direct 3D BCE loss (if GT voxels available)
+    # Direct 3D BCE loss — model outputs 64^3, GT is 64^3
     bce_loss = torch.tensor(0.0, device=device)
     iou_val = 0.0
+    pred_logits = density[:, 0]                      # [B, 64, 64, 64]
     if 'gt_occupancy' in batch:
-        gt_occ = batch['gt_occupancy'].to(device)  # [B, D_gt, D_gt, D_gt]
-        pred_logits = density[:, 0]                 # [B, D, D, D]
-
-        D_pred = pred_logits.shape[-1]
-        D_gt = gt_occ.shape[-1]
-        if D_gt != D_pred:
-            gt_occ = F.interpolate(
-                gt_occ.unsqueeze(1).float(),
-                size=(D_pred, D_pred, D_pred),
-                mode='nearest',
-            ).squeeze(1)
-            gt_occ = (gt_occ > 0.5).float()
+        gt_occ = batch['gt_occupancy'].to(device)    # [B, 64, 64, 64]
 
         n_pos = gt_occ.sum().clamp(min=1.0)
         n_neg = (1 - gt_occ).sum().clamp(min=1.0)
@@ -144,13 +135,18 @@ def compute_loss(model: MVReconModel, batch: dict,
             iou_val = _iou(torch.sigmoid(pred_logits) > 0.5,
                            gt_occ > 0.5).item()
 
-    loss = w_photo * photo_loss + w_mask * mask_loss + w_bce * bce_loss
+    # Sparsity: penalize mean occupancy to fight false-positive voxels
+    sparsity_loss = torch.sigmoid(pred_logits).mean()
+
+    loss = (w_photo * photo_loss + w_mask * mask_loss
+            + w_bce * bce_loss + w_sparse * sparsity_loss)
 
     return loss, {
         'loss': loss.item(),
         'photo': photo_loss.item(),
         'mask': mask_loss.item(),
         'bce': bce_loss.item(),
+        'sparse': sparsity_loss.item(),
         'iou': iou_val,
     }
 
@@ -289,6 +285,7 @@ def train(args):
                   f"photo={avg_metrics.get('photo', 0):.4f} "
                   f"mask={avg_metrics.get('mask', 0):.4f} "
                   f"bce={avg_metrics.get('bce', 0):.4f} "
+                  f"sp={avg_metrics.get('sparse', 0):.4f} "
                   f"iou={avg_metrics.get('iou', 0):.4f} "
                   f"lr={scheduler.get_last_lr()[0]:.2e} "
                   f"({epoch_time:.1f}s)")
@@ -322,7 +319,7 @@ def main():
     parser.add_argument('--volume_size', type=int, default=32)
     parser.add_argument('--feat_channels', type=int, default=128)
     parser.add_argument('--image_size', type=int, default=160)
-    parser.add_argument('--sup_image_size', type=int, default=64)
+    parser.add_argument('--sup_image_size', type=int, default=128)
     parser.add_argument('--n_input_views', type=int, default=4)
     parser.add_argument('--n_sup_views', type=int, default=4)
     parser.add_argument('--n_samples', type=int, default=64)

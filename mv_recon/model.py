@@ -1,10 +1,10 @@
 """Multi-view reconstruction model.
 
 Architecture:
-  1. MobileNetV3-Small shared encoder: 160x160 RGB → 5x5x576 feature maps
+  1. MobileNetV3-Small shared encoder: 160x160 RGB → 20x20x128 feature maps
   2. Geometric unprojection: project 32^3 voxels into each view, sample features
-  3. 3D CNN refinement: aggregate + refine multi-view features
-  4. Occupancy + Color head: per-voxel density and RGB
+  3. Coarse-to-fine 3D CNN: 16^3 → 32^3 → 64^3 progressive refinement
+  4. Occupancy + Color head: per-voxel density and RGB at 64^3
 """
 
 import torch
@@ -164,50 +164,75 @@ class GroupedResBlock3D(nn.Module):
         return self.net(x) + x
 
 
-class Refiner3D(nn.Module):
-    """3D CNN refiner using grouped convolutions (groups=8).
+class CoarseToFineRefiner(nn.Module):
+    """Progressive 3D refinement: 16^3 → 32^3 → 64^3.
 
-    3 residual blocks (6 grouped conv layers). ~120 GFLOPS total at 128ch,
-    estimated ~2s on Quest CPU at INT8.
+    Input: 32^3 feature volume from the unprojector.
+    Stage 1: Downsample to 16^3, 128ch, 1 res block (coarse structure)
+    Stage 2: Upsample to 32^3, concat skip, project to 64ch, 1 res block
+    Stage 3: Upsample to 64^3, project to 32ch, 1 res block (fine detail)
+
+    Total ~12G FLOPs vs ~24G for the old flat refiner — cheaper AND higher res.
     """
 
-    def __init__(self, in_channels: int = 128, mid_channels: int = 128,
-                 groups: int = 8):
+    def __init__(self, in_channels: int = 128, groups: int = 8):
         super().__init__()
-        self.proj_in = nn.Conv3d(in_channels, mid_channels, 1)
-        self.blocks = nn.Sequential(
-            GroupedResBlock3D(mid_channels, groups),
-            GroupedResBlock3D(mid_channels, groups),
-            GroupedResBlock3D(mid_channels, groups),
-        )
-        self.proj_out = nn.Conv3d(mid_channels, in_channels, 1)
+        # Stage 1: 16^3, 128ch
+        self.down = nn.Conv3d(in_channels, in_channels, 2, stride=2)
+        self.stage1 = GroupedResBlock3D(in_channels, groups)
+
+        # Stage 2: upsample to 32^3, concat skip (128+128=256) → 64ch
+        self.up1_proj = nn.Conv3d(in_channels + in_channels, 64, 1)
+        self.stage2 = GroupedResBlock3D(64, groups=8)
+
+        # Stage 3: upsample to 64^3, 64 → 32ch
+        self.up2_proj = nn.Conv3d(64, 32, 1)
+        self.stage3 = GroupedResBlock3D(32, groups=8)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.proj_in(x)
-        h = self.blocks(h)
-        return self.proj_out(h) + x
+        """x: [B, 128, 32, 32, 32] → returns [B, 32, 64, 64, 64]."""
+        skip_32 = x
+
+        # Stage 1: 32^3 → 16^3
+        h = self.down(x)                                       # [B, 128, 16, 16, 16]
+        h = self.stage1(h)                                     # [B, 128, 16, 16, 16]
+
+        # Stage 2: 16^3 → 32^3 + skip
+        h = F.interpolate(h, scale_factor=2, mode='trilinear',
+                          align_corners=False)                 # [B, 128, 32, 32, 32]
+        h = torch.cat([h, skip_32], dim=1)                    # [B, 256, 32, 32, 32]
+        h = self.up1_proj(h)                                   # [B, 64, 32, 32, 32]
+        h = self.stage2(h)                                     # [B, 64, 32, 32, 32]
+
+        # Stage 3: 32^3 → 64^3
+        h = F.interpolate(h, scale_factor=2, mode='trilinear',
+                          align_corners=False)                 # [B, 64, 64, 64, 64]
+        h = self.up2_proj(h)                                   # [B, 32, 64, 64, 64]
+        h = self.stage3(h)                                     # [B, 32, 64, 64, 64]
+
+        return h
 
 
 class OccupancyColorHead(nn.Module):
     """Predicts occupancy logits (1ch) + color logits (3ch) per voxel.
 
-    Separate lightweight branches from the shared feature volume.
+    Operates on the 32ch output of the coarse-to-fine refiner at 64^3.
     Density bias initialized to -5.0 (mostly empty at start).
     """
 
-    def __init__(self, in_channels: int = 64):
+    def __init__(self, in_channels: int = 32):
         super().__init__()
-        density_out = nn.Conv3d(32, 1, 1)
+        density_out = nn.Conv3d(16, 1, 1)
         nn.init.constant_(density_out.bias, -5.0)
         self.density_branch = nn.Sequential(
-            nn.Conv3d(in_channels, 32, 1),
+            nn.Conv3d(in_channels, 16, 1),
             nn.GELU(),
             density_out,
         )
         self.color_branch = nn.Sequential(
-            nn.Conv3d(in_channels, 32, 1),
+            nn.Conv3d(in_channels, 16, 1),
             nn.GELU(),
-            nn.Conv3d(32, 3, 1),
+            nn.Conv3d(16, 3, 1),
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -217,7 +242,8 @@ class OccupancyColorHead(nn.Module):
 class MVReconModel(nn.Module):
     """Full multi-view reconstruction model.
 
-    Returns density [B, 1, D, D, D] and color [B, 3, D, D, D] logits.
+    Unprojects into 32^3, then coarse-to-fine refines to 64^3.
+    Returns density [B, 1, 64, 64, 64] and color [B, 3, 64, 64, 64] logits.
     """
 
     def __init__(self, volume_size: int = 32, feat_channels: int = 128,
@@ -228,8 +254,8 @@ class MVReconModel(nn.Module):
         self.unprojector = GeometricUnprojector(
             volume_size=volume_size, input_size=input_size
         )
-        self.refiner = Refiner3D(in_channels=feat_channels)
-        self.head = OccupancyColorHead(in_channels=feat_channels)
+        self.refiner = CoarseToFineRefiner(in_channels=feat_channels)
+        self.head = OccupancyColorHead(in_channels=32)
 
     def forward(self, images: torch.Tensor,
                 c2w_matrices: torch.Tensor
@@ -240,8 +266,8 @@ class MVReconModel(nn.Module):
             c2w_matrices: [B, N, 4, 4] Blender camera-to-world matrices
 
         Returns:
-            density: [B, 1, D, D, D] occupancy logits
-            color: [B, 3, D, D, D] color logits (apply sigmoid for RGB)
+            density: [B, 1, 64, 64, 64] occupancy logits
+            color: [B, 3, 64, 64, 64] color logits (apply sigmoid for RGB)
         """
         B, N, C, H, W = images.shape
 
@@ -251,8 +277,8 @@ class MVReconModel(nn.Module):
         h, w = feats.shape[2], feats.shape[3]
         feats = feats.reshape(B, N, feat_ch, h, w)
 
-        volume = self.unprojector(feats, c2w_matrices)
-        volume = self.refiner(volume)
+        volume = self.unprojector(feats, c2w_matrices)  # [B, 128, 32, 32, 32]
+        volume = self.refiner(volume)                    # [B, 32, 64, 64, 64]
         return self.head(volume)
 
     def param_count(self) -> dict:
