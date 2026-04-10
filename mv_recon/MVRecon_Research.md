@@ -1,7 +1,7 @@
 # MVRecon: Lightweight Multi-View 3D Object Reconstruction
 
 **Date**: 2026-04-10
-**Status**: Full-dataset training in progress (4,982 objects, 50 epochs)
+**Status**: Architecture v2 validated; full-dataset training pending (4,982 objects, 100 epochs)
 **Context**: On-device 3D reconstruction for Meta Quest 3 room scanning
 
 ---
@@ -42,21 +42,21 @@ This eliminates the transformer decoder, the triplane representation, and the Ne
 
 ## 2. Architecture
 
-### 2.1 Overview
+### 2.1 Overview (v2)
 
 ```
 Input: N views × 160×160 RGB + N × 4×4 camera-to-world matrices
   │
-  ├─ FeatureEncoder (shared MobileNetV3-Small)
+  ├─ FeatureEncoder (shared MobileNetV3-Small, three-scale)
   │    → N × 128ch × 20×20 feature maps
   │
-  ├─ GeometricUnprojector
+  ├─ GeometricUnprojector (mean + variance fusion)
   │    Project 32³ voxel grid into each view,
   │    sample features via grid_sample,
-  │    average across views
-  │    → 128ch × 32×32×32 feature volume
+  │    compute per-voxel mean + variance across views
+  │    → 256ch × 32×32×32 feature volume
   │
-  ├─ CoarseToFineRefiner (3D CNN)
+  ├─ CoarseToFineRefiner (3D CNN, groups=4)
   │    16³ → 32³ → 64³ progressive refinement
   │    → 32ch × 64×64×64
   │
@@ -67,14 +67,21 @@ Input: N views × 160×160 RGB + N × 4×4 camera-to-world matrices
 
 ### 2.2 Component Details
 
-#### FeatureEncoder (0.2M params)
+#### FeatureEncoder (0.9M params)
 
-MobileNetV3-Small pretrained on ImageNet. Extracts multi-scale features:
-- Early layers (0–3): 20×20 × 24ch
-- Mid layers (4–8): 10×10 × 48ch, upsampled to 20×20
-- Concatenated (72ch) and projected to 128ch via 1×1 conv
+MobileNetV3-Small pretrained on ImageNet. Extracts features at three spatial scales, all upsampled to 20×20 and concatenated:
 
-The encoder is **shared** across all input views — each view is processed independently, then fused geometrically.
+| Scale | Layers | Spatial | Channels |
+|-------|--------|---------|----------|
+| Early | 0–3 | 20×20 | 24 |
+| Mid | 4–8 | 10×10 → 20×20 | 48 |
+| Late | 9–11 | 5×5 → 20×20 | 96 |
+
+Concatenated (168ch) and projected to 128ch via 1×1 conv.
+
+The late layers (added in v2) provide higher-level semantic features — object part understanding, shape priors — while the early/mid layers provide fine spatial detail. The encoder is **shared** across all input views.
+
+**v1→v2 change**: Two-scale (72ch) → three-scale (168ch). The extra pretrained layers add 692K params but provide significantly richer features without any untrained capacity — all weights come from ImageNet pretraining.
 
 #### GeometricUnprojector (0 learned params)
 
@@ -85,40 +92,50 @@ This is the architectural key — it replaces the transformer decoder with deter
 3. Project all 32,768 voxel centers into each view's image plane using known intrinsics
 4. Sample the 128-channel feature map at each projected location via bilinear `grid_sample`
 5. Mask out voxels that fall behind the camera or outside the image bounds
-6. Average features across views (weighted by visibility count)
+6. Compute **mean** and **variance** of features across views, concatenate → 256ch
 
-This operation is fully differentiable and batched — no Python loops over views or voxels. The result is a 128×32×32×32 feature volume where each voxel contains the average appearance from all views that see it.
+The mean+variance fusion (added in v2) replaces simple averaging. The variance channel encodes **view consistency**: low variance at a voxel means multiple views agree on its appearance (likely a real surface), high variance means views disagree (likely occlusion, empty space, or a depth boundary). This gives the refiner a powerful geometric signal with zero additional parameters.
 
-#### CoarseToFineRefiner (0.3M params)
+The result is a 256×32×32×32 feature volume. The operation is fully differentiable and batched — no Python loops over views or voxels.
 
-Progressive 3D refinement using grouped convolutions (groups=8):
+#### CoarseToFineRefiner (1.4M params)
 
-| Stage | Resolution | Channels | Operation |
-|-------|-----------|----------|-----------|
-| 1 | 32³ → 16³ | 128 | Strided conv + GroupedResBlock |
-| 2 | 16³ → 32³ | 128 → 64 | Trilinear upsample + skip concat + GroupedResBlock |
-| 3 | 32³ → 64³ | 64 → 32 | Trilinear upsample + GroupedResBlock |
+Progressive 3D refinement using grouped convolutions (groups=4):
 
-The coarse stage captures global structure, the fine stage adds detail. Skip connections from the input volume preserve unprojected features.
+| Stage | Resolution | Channels | Blocks | Operation |
+|-------|-----------|----------|--------|-----------|
+| 1 | 32³ → 16³ | 256 | 1 | AvgPool + GroupedResBlock |
+| 2 | 16³ → 32³ | 512 → 128 | 2 | Trilinear upsample + skip concat + 1×1 proj + 2× GroupedResBlock |
+| 3 | 32³ → 64³ | 128 → 32 | 1 | Trilinear upsample + 1×1 proj + GroupedResBlock |
 
-Groups=8 gives 8× fewer FLOPs than standard conv3d while training efficiently on Apple MPS (unlike depthwise, which has a slow backward pass on MPS).
+The coarse stage captures global structure at 16³ with the full 256-channel mean+variance volume. Stage 2 is the workhorse — it gets 2 res blocks and a skip connection from the input volume, operating at the native unprojection resolution. The fine stage adds surface detail at 64³.
 
-#### OccupancyColorHead (0.001M params)
+**v1→v2 changes**:
+- Groups: 8 → 4 (2× more cross-channel mixing per layer)
+- Input channels: 128 → 256 (from mean+variance fusion)
+- Stage 2: 1 block → 2 blocks (where skip connection enriches features)
+- Downsampling: strided conv → AvgPool3d (simpler, no wasted params)
+- Total: 296K → 1.41M params (4.8×)
+
+#### OccupancyColorHead (0.002M params)
 
 Two tiny branches from the 32ch refined volume:
-- **Density**: 32→16→1 (Conv3d 1×1, GELU, Conv3d 1×1). Bias initialized to -5.0 (sigmoid(-5)≈0.007 — mostly empty at start)
-- **Color**: 32→16→3 (Conv3d 1×1, GELU, Conv3d 1×1). Sigmoid applied for RGB
+- **Density**: 32→32→1 (Conv3d 1×1, GELU, Conv3d 1×1). Bias initialized to -5.0 (sigmoid(-5)≈0.007 — mostly empty at start)
+- **Color**: 32→32→3 (Conv3d 1×1, GELU, Conv3d 1×1). Sigmoid applied for RGB
+
+**v1→v2 change**: Intermediate channels doubled (16→32) for slightly more capacity.
 
 ### 2.3 Parameter Count
 
-| Component | Params | Size (FP32) |
-|-----------|--------|-------------|
-| FeatureEncoder (MobileNetV3-Small) | 199,864 | 0.8 MB |
-| CoarseToFineRefiner | 296,224 | 1.1 MB |
-| OccupancyColorHead | 1,124 | 0.004 MB |
-| **Total** | **497,212** | **2.0 MB** |
+| Component | v1 Params | v2 Params | Change |
+|-----------|-----------|-----------|--------|
+| FeatureEncoder | 199,864 | 892,192 | +692K (pretrained layers) |
+| GeometricUnprojector | 0 | 0 | — |
+| CoarseToFineRefiner | 296,224 | 1,413,984 | +1.1M (wider, deeper) |
+| OccupancyColorHead | 1,124 | 2,244 | +1.1K |
+| **Total** | **497,212 (0.5M)** | **2,308,420 (2.3M)** | **4.6×** |
 
-This is **843× smaller** than TripoSR (419M) and **100× smaller** than the distilled student (50M).
+v2 is still **181× smaller** than TripoSR (419M) and **22× smaller** than the distilled student (50M). Quest inference estimated at 6–7s (within 10s budget, vs 1.5s for v1).
 
 ---
 
@@ -141,11 +158,11 @@ This is **843× smaller** than TripoSR (419M) and **100× smaller** than the dis
 
 Four-component hybrid loss:
 
-#### 3.2.1 3D BCE Loss (weight=0.5)
+#### 3.2.1 3D BCE Loss (weight=1.0, was 0.5 in v1)
 
 Direct binary cross-entropy between predicted 64³ occupancy (sigmoid of logits) and GT voxels. Uses class-balanced pos_weight (capped at 20×) since objects are sparse (~2% filled).
 
-This is the geometry workhorse — provides direct voxel-level supervision without any rendering.
+This is the geometry workhorse — provides direct voxel-level supervision without any rendering. Weight increased from 0.5 to 1.0 in v2 to make shape accuracy the primary training objective.
 
 #### 3.2.2 Photometric Loss (weight=1.0)
 
@@ -167,26 +184,44 @@ Same ray casting as photometric, but compares accumulated opacity against the GT
 
 ### 3.3 Training Configuration
 
-| Parameter | Value |
-|-----------|-------|
-| Optimizer | AdamW (lr=1e-3, weight_decay=1e-4) |
-| Scheduler | CosineAnnealing (T_max=50, eta_min=1e-5) |
-| Epochs | 50 |
-| Batch size | 1 (per-object, sequential) |
-| Input views | 4 (randomly selected from 24) |
-| Supervision views | 4 (from remaining 20) |
-| Input resolution | 160×160 (ImageNet-normalized) |
-| Supervision resolution | 128×128 |
-| Rays per supervision view | 1024 |
-| Samples per ray | 64 |
-| Device | Apple MPS (M4 Max) |
-| DataLoader workers | 4 |
-| Gradient clipping | max_norm=1.0 |
-| Validation | Every 5 epochs (mean IoU on val set) |
-| Early stopping | 50 epochs without val IoU improvement |
-| Checkpointing | Every 5 epochs + best val IoU |
+| Parameter | v1 | v2 |
+|-----------|----|----|
+| Optimizer | AdamW (lr=1e-3, wd=1e-4) | same |
+| Scheduler | CosineAnnealing (T_max=50) | **5-epoch linear warmup + cosine decay** |
+| Epochs | 50 | **100** |
+| Effective batch size | 1 | **8 (grad_accum=8)** |
+| Input views | 4 (randomly selected from 24) | same |
+| Supervision views | 4 (from remaining 20) | same |
+| Input resolution | 160×160 (ImageNet-normalized) | same |
+| Supervision resolution | 128×128 | same |
+| Rays per supervision view | 1024 | same |
+| Samples per ray | 64 | same |
+| Device | Apple MPS (M4 Max) | same |
+| DataLoader workers | 4 | same |
+| Gradient clipping | max_norm=1.0 | same |
+| Validation | Every 5 epochs | **Every 2 epochs** |
+| Early stopping | 50 epochs | **20 epochs** |
+| w_bce | 0.5 | **1.0** |
+| Color jitter | (0.2, 0.2, 0.15, 0.02) | **(0.15, 0.15, 0.1, 0.02)** |
 
-**Estimated training time**: ~38 min/epoch × 50 epochs ≈ 32 hours.
+Key v2 recipe changes:
+- **LR warmup** (5 epochs): prevents early training instability with the larger model
+- **Gradient accumulation** (8 steps): smooths gradients from the noisy batch-size-1 training
+- **Higher w_bce**: focuses the model on getting 3D shape right as the primary objective
+- **More frequent validation**: better tracking of generalization trends
+
+### 3.3.1 Data Augmentation
+
+Applied during training to close the domain gap between clean Objaverse renders and noisy Quest camera images:
+
+| Augmentation | Parameters | Purpose |
+|---|---|---|
+| Random backgrounds | Random solid color behind alpha-masked object | Quest scenes have varied backgrounds |
+| Horizontal flip | 50% probability, camera pose mirrored | Double effective dataset size |
+| Color jitter | brightness=0.15, contrast=0.15, saturation=0.1, hue=0.02 | Quest camera color variation |
+| Gaussian noise | σ ∈ [0.04, 0.08], randomized per sample | Quest sensor noise |
+
+Gaussian noise was retained despite increasing training difficulty because Quest images genuinely contain sensor noise — the larger v2 model has sufficient capacity to learn through it. Color jitter was slightly reduced from v1 values to avoid overwhelming the model during early training.
 
 ### 3.4 Training Evolution
 
@@ -202,7 +237,9 @@ The architecture and training went through several iterations during the 11-obje
 
 5. **v5 — Camera axis fix**: Discovered that render camera orientations didn't match GT voxel axes. Validation script confirmed the fix.
 
-6. **v6 — Current full training**: 4,982 objects, all fixes incorporated.
+6. **v6 — Full training attempt (v1 architecture)**: 4,484 train / 498 val objects, 50 epochs with augmentation. Val IoU plateaued at ~0.34 from epoch 1 — the 0.5M model lacked capacity to generalize across 4,500 diverse objects.
+
+7. **v7 — Architecture v2 (current)**: Diagnosed capacity bottleneck. Scaled encoder (3-scale features), added mean+variance view fusion, widened refiner (groups 8→4, +1 block at stage 2). 0.5M → 2.3M params. Overfit test confirmed faster learning and higher ceiling.
 
 ### 3.5 Generalization Evidence
 
@@ -238,21 +275,21 @@ Unity C# pipeline (`OrtMVReconModel.cs`):
 
 ### 4.3 Quest 3 Performance
 
-**Measured: 1.5 seconds end-to-end** — confirmed on Quest 3 via the debug menu MVRecon tab.
+v1 (0.5M params) was **measured at 1.5 seconds end-to-end** on Quest 3. v2 (2.3M params) is estimated at **6–7 seconds** based on 4.6× parameter increase and heavier 3D convolutions, still within the 10-second budget. Quest measurement pending after full training completion.
 
-| Metric | MVRecon | TripoSR (pruned QDQ 384) |
-|--------|---------|--------------------------|
-| E2E latency | **1.5s** | 54s |
-| Model size | **2.8 MB** | ~170 MB |
-| Input | 3 views × 160px | 1 view × 384px |
-| Output | 64³ occupancy → marching cubes | Triplane → NeRF decoder |
-| Parameters | **0.5M** | ~50M |
+| Metric | MVRecon v1 | MVRecon v2 (est.) | TripoSR (pruned QDQ 384) |
+|--------|-----------|-------------------|--------------------------|
+| E2E latency | 1.5s | **~6–7s** | 54s |
+| Model size | 2.8 MB | **~9 MB** | ~170 MB |
+| Input | 3 views × 160px | 3 views × 160px | 1 view × 384px |
+| Output | 64³ occupancy | 64³ occupancy | Triplane → NeRF decoder |
+| Parameters | 0.5M | **2.3M** | ~50M |
 
-This is:
-- **36× faster** than the deployed TripoSR pipeline
-- **6.7× faster** than the 10-second target
-- **60× smaller** model file
-- **100× fewer** parameters
+v2 compared to TripoSR:
+- **~8× faster** than the deployed TripoSR pipeline
+- **Within 10-second** interactive target
+- **~19× smaller** model file
+- **~22× fewer** parameters
 
 ---
 
@@ -260,25 +297,26 @@ This is:
 
 ### 5.1 Architectural Comparison
 
-| | TripoSR (Teacher) | TripoSR-Lite (Student) | **MVRecon** |
+| | TripoSR (Teacher) | TripoSR-Lite (Student) | **MVRecon v2** |
 |---|---|---|---|
 | **Paradigm** | Single-view, learned prior | Single-view, distilled prior | **Multi-view, geometric fusion** |
-| **Encoder** | DINO ViT-B/16 (86M) | MobileNetV3-Large (3.7M) | MobileNetV3-Small (0.2M) |
+| **Encoder** | DINO ViT-B/16 (86M) | MobileNetV3-Large (3.7M) | MobileNetV3-Small 3-scale (0.9M) |
+| **View fusion** | N/A | N/A | **Mean+variance unprojection** |
 | **3D Representation** | Triplane (3×40×64²) | Triplane (3×40×32²) | **Voxel grid (64³)** |
-| **Decoder** | 16L Transformer (330M) + NeRF MLP | 8L Transformer (44M) + NeRF MLP | **3D CNN (0.3M), no MLP** |
+| **Decoder** | 16L Transformer (330M) + NeRF MLP | 8L Transformer (44M) + NeRF MLP | **3D CNN (1.4M), no MLP** |
 | **Camera info** | Not used | Not used | **Required (c2w matrices)** |
 | **Multi-view** | N/A (single image) | N/A (single image) | **Native (1–10 views)** |
-| **Total params** | 419M | 50M | **0.5M** |
+| **Total params** | 419M | 50M | **2.3M** |
 
 ### 5.2 Why Geometric Unprojection Works
 
 The transformer decoder in TripoSR/student learns an **implicit** mapping from 2D tokens to 3D triplane features. This requires hundreds of millions of parameters because it must encode the full distribution of possible 3D structures.
 
 MVRecon replaces this with an **explicit** geometric operation: given a voxel at world position (x,y,z) and a camera at known pose, the 2D pixel location is deterministic trigonometry. The model only needs to learn:
-1. What 2D features to extract (MobileNetV3: 0.2M params)
-2. How to clean up the fused 3D volume (3D CNN: 0.3M params)
+1. What 2D features to extract (MobileNetV3 3-scale: 0.9M params)
+2. How to clean up the fused 3D volume (3D CNN: 1.4M params)
 
-The camera-aware unprojection eliminates ~99.9% of the parameters.
+The camera-aware unprojection eliminates ~99.5% of the parameters.
 
 ### 5.3 Limitations vs TripoSR
 
@@ -328,7 +366,7 @@ MobileNetV3-Small (0.2M used) vs Large (3.7M): the encoder only needs to produce
 
 ### 7.2 Why Grouped Convolutions (not Depthwise Separable)?
 
-Groups=8 is a compromise for training on Apple MPS. Depthwise convolutions (groups=channels) have a known slow backward pass on MPS. Groups=8 gives 8× fewer FLOPs than standard conv while training at full speed. For Quest deployment, these can be converted to depthwise-separable post-training.
+Groups=4 (v2, previously groups=8 in v1) is a compromise between cross-channel mixing and compute efficiency on Apple MPS. Depthwise convolutions (groups=channels) have a known slow backward pass on MPS. Groups=4 allows each group to mix 64 channels in a 256-channel layer — enough for meaningful cross-feature learning. v1's groups=8 was too restrictive (only 16ch cross-talk per group), contributing to the model's inability to generalize.
 
 ### 7.3 Why Sigmoid Alpha (not Softplus Density)?
 
@@ -342,20 +380,38 @@ Unprojecting at 64³ would require 262K voxels × N views grid_sample operations
 
 - **BCE alone**: Fast training, direct geometry signal, but doesn't teach the model about view-dependent appearance or silhouette accuracy
 - **Rendering alone**: Teaches appearance but converges slowly and can get stuck in local minima (blurry volumes)
-- **Combined**: BCE provides a strong geometric scaffold; rendering loss refines silhouettes and appearance. The BCE loss (weight=0.5) contributes ~40% of total loss.
+- **Combined**: BCE provides a strong geometric scaffold; rendering loss refines silhouettes and appearance. In v2, BCE weight was raised to 1.0 (from 0.5) to make shape accuracy the dominant training signal.
 
 ---
 
-## 8. Future Work
+## 8. v1 → v2 Changelog
 
-### 8.1 Full Training Evaluation (In Progress)
+v1 trained successfully on 11 overfit objects (IoU 0.82) but **failed to generalize** when scaled to 4,484 diverse objects — val IoU plateaued at ~0.34 from epoch 1. Root cause analysis:
 
-50-epoch training on 4,982 objects is running. Key metrics to track:
-- Val IoU convergence
+| Bottleneck | v1 Issue | v2 Fix |
+|---|---|---|
+| **Encoder capacity** | 2-scale (72ch), ~200K params. Not enough semantic richness for diverse object categories | 3-scale (168ch), ~892K params. Late MobileNetV3 layers add object-part understanding |
+| **View fusion** | Mean pooling discards consistency info. Model can't distinguish "all views agree" from "views disagree" | Mean + variance fusion. Zero-cost signal tells refiner which voxels are reliably seen |
+| **Refiner cross-channel mixing** | groups=8 → only 16ch cross-talk per group. Too restrictive for learning complex 3D patterns | groups=4 → 64ch cross-talk per group. 2× more feature interaction |
+| **Refiner depth** | 1 block per stage, 296K params. Insufficient capacity for 4500 diverse shapes | 2 blocks at stage 2 (skip-enriched), 1.41M params. Capacity where it matters most |
+| **Training stability** | No warmup, effective batch=1 | 5-epoch LR warmup + grad_accum=8 for smoother optimization |
+| **Shape supervision** | w_bce=0.5, roughly equal to rendering loss | w_bce=1.0, shape accuracy is the primary objective |
+
+**Total: 0.5M → 2.3M params (4.6×), estimated Quest inference 6–7s (within 10s budget)**
+
+---
+
+## 9. Future Work
+
+### 9.1 Full Training Evaluation (Pending)
+
+100-epoch v2 training on 4,484 train objects (498 val) with early stopping. Key metrics to track:
+- Val IoU convergence and comparison to v1's plateau at ~0.34
 - Generalization: val-set mesh quality vs train-set
 - Failure modes: which object types are hardest?
+- Whether the 2.3M model's additional capacity translates to measurably better generalization
 
-### 8.2 Quest Deployment with Trained Model
+### 9.2 Quest Deployment with Trained Model
 
 After training:
 1. Export best checkpoint to ONNX
@@ -363,7 +419,7 @@ After training:
 3. Visual quality evaluation on Quest with diverse test objects
 4. A/B comparison with TripoSR output quality
 
-### 8.3 Potential Improvements
+### 9.3 Potential Improvements
 
 - **Depth input**: Add Quest 3 depth sensor data as a 4th encoder channel for geometric bootstrapping
 - **Adaptive view selection**: Prioritize views with maximal angular coverage rather than random selection
@@ -373,7 +429,7 @@ After training:
 
 ---
 
-## 9. References
+## 10. References
 
 - **TripoSR**: Tochilkin et al., 2024. "TripoSR: Fast 3D Object Reconstruction from a Single Image." MIT License.
 - **LRM**: Hong et al., ICLR 2024. "Large Reconstruction Model for Single Image to 3D."
@@ -408,11 +464,18 @@ python -u -m mv_recon.voxelize \
   --cache_dir ~/Downloads/mv_recon_data/objaverse_cache \
   --output_dir ~/Downloads/mv_recon_data/voxels --workers 1
 
-# Train (50 epochs, ~32 hours on M4 Max)
+# Overfit test (10 objects, 1000 epochs, ~100 min on M4 Max)
+python -u -m mv_recon.train \
+  --mode overfit --augment \
+  --epochs 1000 --lr 1e-3 --warmup_epochs 5 \
+  --n_rays_per_view 1024 --n_samples 64 --sup_image_size 128
+
+# Full training v2 (100 epochs, ~48 hours on M4 Max)
 python -u -m mv_recon.train \
   --mode full --data_dir ~/Downloads/mv_recon_data \
   --uids_file filtered_uids.json \
-  --epochs 50 --val_every 5 --lr 1e-3
+  --epochs 100 --val_every 2 --lr 1e-3 --warmup_epochs 5 \
+  --grad_accum 8 --early_stop 20 --augment
 
 # Extract meshes
 python -u -m mv_recon.extract_mesh \

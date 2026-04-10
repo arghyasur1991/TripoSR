@@ -49,7 +49,7 @@ class ObjaverseMultiViewDataset(Dataset):
         self.imagenet_normalize = transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)
 
         self.color_jitter = transforms.ColorJitter(
-            brightness=0.2, contrast=0.2, saturation=0.15, hue=0.02,
+            brightness=0.15, contrast=0.15, saturation=0.1, hue=0.02,
         ) if augment else None
 
         # Pre-load all camera data

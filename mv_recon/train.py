@@ -17,6 +17,7 @@ Usage:
 import argparse
 import csv
 import json
+import math
 import random
 import time
 from datetime import datetime
@@ -120,7 +121,7 @@ def compute_loss(model: MVReconModel, batch: dict,
                  n_samples: int = 64, n_rays_per_view: int = 512,
                  sup_image_size: int = 128,
                  w_photo: float = 1.0, w_mask: float = 0.1,
-                 w_bce: float = 0.5, w_sparse: float = 0.02,
+                 w_bce: float = 1.0, w_sparse: float = 0.02,
                  ) -> tuple[torch.Tensor, dict]:
     """Hybrid loss: photometric + mask + 3D BCE + sparsity.
 
@@ -295,9 +296,17 @@ def train(args):
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
-    )
+
+    warmup_epochs = args.warmup_epochs
+    total_after_warmup = max(args.epochs - warmup_epochs, 1)
+
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / total_after_warmup
+        return 0.01 + 0.5 * 0.99 * (1 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     start_epoch = 1
     best_val_iou = 0.0
@@ -503,14 +512,16 @@ def main():
                         help='Root data directory containing renders/ and voxels/')
     parser.add_argument('--uids_file', type=str, default=None,
                         help='Path to JSON file with UID list (e.g. filtered_uids.json)')
-    parser.add_argument('--val_every', type=int, default=5,
+    parser.add_argument('--val_every', type=int, default=2,
                         help='Run validation every N epochs')
     parser.add_argument('--num_workers', type=int, default=4,
                         help='DataLoader worker count')
-    parser.add_argument('--grad_accum', type=int, default=1,
-                        help='Gradient accumulation steps')
-    parser.add_argument('--early_stop', type=int, default=50,
+    parser.add_argument('--grad_accum', type=int, default=8,
+                        help='Gradient accumulation steps (effective batch size)')
+    parser.add_argument('--early_stop', type=int, default=20,
                         help='Stop if val IoU stalls for N epochs (0=disabled)')
+    parser.add_argument('--warmup_epochs', type=int, default=5,
+                        help='Linear LR warmup epochs before cosine decay')
     parser.add_argument('--augment', action='store_true', default=None,
                         help='Force augmentation on (default: auto, on for full mode)')
     args = parser.parse_args()

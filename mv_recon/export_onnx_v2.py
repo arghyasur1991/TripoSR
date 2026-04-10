@@ -62,7 +62,7 @@ class ExportableUnprojector(nn.Module):
             features: [B, N, C, h, w]
             w2c_cv:   [B, N, 3, 4] pre-computed world-to-camera (OpenCV)
         Returns:
-            volume: [B, C, D, D, D]
+            volume: [B, 2*C, D, D, D] mean+variance fused volume
         """
         B, N, C, h, w = features.shape
         V = self.volume_size
@@ -71,7 +71,6 @@ class ExportableUnprojector(nn.Module):
         ones = torch.ones(P, 1, device=features.device, dtype=features.dtype)
         pts_h = torch.cat([self.voxel_centers, ones], dim=-1)  # [P, 4]
 
-        # [B, N, 3, 4] x [P, 4]^T → [B, N, 3, P] → transpose → [B, N, P, 3]
         pts_cam = torch.einsum('bnij,pj->bnpi', w2c_cv, pts_h)
 
         depth = pts_cam[..., 2]
@@ -98,9 +97,14 @@ class ExportableUnprojector(nn.Module):
         sampled = sampled * valid.unsqueeze(2).float()
 
         count = valid.float().sum(dim=1, keepdim=True).clamp(min=1.0)
-        volume = sampled.sum(dim=1) / count.squeeze(1).unsqueeze(1)
+        count_bc = count.squeeze(1).unsqueeze(1)
 
-        return volume.reshape(B, C, V, V, V)
+        mean = sampled.sum(dim=1) / count_bc
+        sq_mean = (sampled ** 2).sum(dim=1) / count_bc
+        var = (sq_mean - mean ** 2).clamp(min=0)
+
+        volume = torch.cat([mean, var], dim=1)  # [B, 2C, P]
+        return volume.reshape(B, 2 * C, V, V, V)
 
 
 class ExportableModel(nn.Module):
@@ -142,12 +146,15 @@ class ExportableModel(nn.Module):
         return self.head(volume)
 
 
-def load_model(checkpoint_path: str, device: str = 'cpu') -> MVReconModel:
+def load_model(checkpoint_path: str, device: str = 'cpu',
+               volume_size: int = 32, feat_channels: int = 128,
+               input_size: int = 160) -> MVReconModel:
     """Load trained MVReconModel from checkpoint."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
 
-    model = MVReconModel(volume_size=32, feat_channels=128, input_size=160)
+    model = MVReconModel(volume_size=volume_size, feat_channels=feat_channels,
+                         input_size=input_size)
     model.load_state_dict(state)
     model.eval()
     return model.to(device)
@@ -155,7 +162,7 @@ def load_model(checkpoint_path: str, device: str = 'cpu') -> MVReconModel:
 
 def export_onnx(model: ExportableModel, output_path: str,
                 n_views: int = 3, input_size: int = 160,
-                opset: int = 17):
+                opset: int = 21):
     """Export to ONNX with fixed shapes."""
     model.eval()
     device = next(model.parameters()).device
@@ -282,7 +289,7 @@ def main():
                         help='Output ONNX path (default: same dir as checkpoint)')
     parser.add_argument('--n_views', type=int, default=3)
     parser.add_argument('--input_size', type=int, default=160)
-    parser.add_argument('--opset', type=int, default=18)
+    parser.add_argument('--opset', type=int, default=21)
     parser.add_argument('--skip_verify', action='store_true')
     args = parser.parse_args()
 
