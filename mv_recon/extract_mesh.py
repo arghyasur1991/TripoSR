@@ -214,7 +214,13 @@ def extract(args):
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
     print(f"Device: {device}")
 
-    uids = OVERFIT_11_UIDS if args.mode == 'overfit' else ALL_18_UIDS
+    if args.uids:
+        import json
+        uids = json.loads(args.uids) if args.uids.startswith('[') else args.uids.split(',')
+    elif args.mode == 'overfit':
+        uids = OVERFIT_11_UIDS
+    else:
+        uids = ALL_18_UIDS
     print(f"Mode: {args.mode}, Objects: {len(uids)}")
 
     dataset = ObjaverseMultiViewDataset(
@@ -341,6 +347,8 @@ def main():
     parser.add_argument('--output_dir', type=str, default='output/mv_recon_overfit')
     parser.add_argument('--mc_threshold', type=float, default=0.7,
                         help='Marching cubes threshold (higher = less noise)')
+    parser.add_argument('--uids', type=str, default=None,
+                        help='Comma-separated UIDs or JSON array (overrides --mode)')
     args = parser.parse_args()
     extract(args)
 

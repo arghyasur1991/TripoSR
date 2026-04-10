@@ -5,21 +5,28 @@ same coordinate frame as the render pipeline (render_views.py).  Exports
 normalized meshes as STL, then loads with trimesh for voxelization.
 
 Usage:
+    # Bulk (all UIDs from filtered_uids.json):
+    python -m mv_recon.voxelize --uids filtered_uids.json --manifest object_manifest.json --workers 8
+
+    # Small set (legacy):
     python -m mv_recon.voxelize --volume_size 64
 """
 
 import argparse
+import json
+import shutil
 import subprocess
 import tempfile
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
 import trimesh
 
-from .train import ALL_18_UIDS
-
-GLBS_DIR = Path.home() / "Downloads" / "mv_recon_data" / "glbs"
-VOXELS_DIR = Path.home() / "Downloads" / "mv_recon_data" / "voxels"
+DATA_DIR = Path.home() / "Downloads" / "mv_recon_data"
+GLBS_DIR = DATA_DIR / "glbs"
+VOXELS_DIR = DATA_DIR / "voxels"
 BLENDER_PATH = "/Applications/Blender.app/Contents/MacOS/Blender"
 
 # Blender script: import GLB, normalize exactly like render_views.py, export STL.
@@ -133,23 +140,19 @@ def normalize_with_blender(glb_path: str, output_stl: str) -> bool:
 
 def voxelize_mesh(mesh: trimesh.Trimesh, volume_size: int = 64,
                   voxel_range: float = 0.55,
-                  n_surface_samples: int = 500_000) -> np.ndarray:
+                  n_surface_samples: int = 1_000_000) -> np.ndarray:
     """Voxelize a normalized mesh into a binary occupancy grid.
 
-    Two-pass approach:
-      1. Dense surface sampling: scatter many points onto the mesh surface
-         and mark their enclosing voxels. Captures thin structures reliably.
-      2. Solid fill: also fills interior of watertight regions.
-    Union of both passes gives the final grid.
+    Uses dense surface sampling only (no flood-fill) to keep memory bounded.
+    1M surface samples at 64^3 gives excellent coverage without the 10GB+
+    memory cost of trimesh's voxelized().fill() on complex meshes.
 
     The grid spans [-voxel_range, voxel_range]^3 to match the model's volume.
     Grid layout is [z, y, x] to match the model's volume indexing.
     """
     D = volume_size
-    pitch = (2 * voxel_range) / D
     grid = np.zeros((D, D, D), dtype=np.float32)
 
-    # Pass 1: surface sampling — handles thin structures
     pts = mesh.sample(n_surface_samples)
     ix = np.round((pts[:, 0] + voxel_range) / (2 * voxel_range) * (D - 1)).astype(int)
     iy = np.round((pts[:, 1] + voxel_range) / (2 * voxel_range) * (D - 1)).astype(int)
@@ -161,19 +164,61 @@ def voxelize_mesh(mesh: trimesh.Trimesh, volume_size: int = 64,
     )
     grid[iz[valid], iy[valid], ix[valid]] = 1.0
 
-    # Pass 2: solid fill for watertight interior
-    try:
-        vox = mesh.voxelized(pitch).fill()
-        for pt in vox.points:
-            jx = round((pt[0] + voxel_range) / (2 * voxel_range) * (D - 1))
-            jy = round((pt[1] + voxel_range) / (2 * voxel_range) * (D - 1))
-            jz = round((pt[2] + voxel_range) / (2 * voxel_range) * (D - 1))
-            if 0 <= jx < D and 0 <= jy < D and 0 <= jz < D:
-                grid[jz, jy, jx] = 1.0
-    except Exception:
-        pass
-
     return grid
+
+
+def _resolve_glb_path(uid: str, manifest: dict | None,
+                      glbs_dir: Path, cache_dir: Path | None) -> Path | None:
+    """Find the GLB file for a UID, checking manifest → cache_dir → glbs_dir."""
+    if manifest and uid in manifest:
+        raw = manifest[uid]
+        # Manifest stores absolute GDrive FUSE paths; remap to local cache_dir
+        if cache_dir:
+            # Extract relative path after "objaverse_cache/"
+            marker = "objaverse_cache/"
+            idx = raw.find(marker)
+            if idx >= 0:
+                rel = raw[idx + len(marker):]
+                local = cache_dir / rel
+                if local.exists():
+                    return local
+        p = Path(raw)
+        if p.exists():
+            return p
+
+    flat = glbs_dir / f"{uid}.glb"
+    if flat.exists():
+        return flat
+    return None
+
+
+def _process_one(args_tuple):
+    """Worker function for multiprocessing: voxelize one UID."""
+    uid, glb_path_str, output_dir_str, volume_size = args_tuple
+    output_dir = Path(output_dir_str)
+    out_path = output_dir / f"{uid}.npy"
+    if out_path.exists():
+        return uid, "skip", 0.0
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f"vox_{uid[:8]}_"))
+    tmp_stl = tmp_dir / f"{uid}.stl"
+    try:
+        ok = normalize_with_blender(glb_path_str, str(tmp_stl))
+        if not ok or not tmp_stl.exists():
+            return uid, "blender_fail", 0.0
+
+        mesh = trimesh.load(str(tmp_stl))
+        if isinstance(mesh, trimesh.Scene):
+            mesh = mesh.to_geometry()
+
+        grid = voxelize_mesh(mesh, volume_size)
+        np.save(out_path, grid)
+        pct = 100.0 * grid.sum() / grid.size
+        return uid, "ok", pct
+    except Exception as e:
+        return uid, f"error: {e}", 0.0
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def main():
@@ -181,53 +226,99 @@ def main():
     parser.add_argument("--volume_size", type=int, default=64)
     parser.add_argument("--glbs_dir", type=str, default=str(GLBS_DIR))
     parser.add_argument("--output_dir", type=str, default=str(VOXELS_DIR))
+    parser.add_argument("--uids", type=str, default=None,
+                        help="Path to filtered_uids.json (if omitted, uses legacy 18 UIDs)")
+    parser.add_argument("--manifest", type=str, default=None,
+                        help="Path to object_manifest.json mapping UID→GLB path")
+    parser.add_argument("--cache_dir", type=str, default=None,
+                        help="Local copy of objaverse_cache/ (rclone download)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of parallel Blender workers")
     args = parser.parse_args()
 
+    # Load UIDs
+    if args.uids:
+        with open(args.uids) as f:
+            uids = json.load(f)
+    else:
+        from .train import ALL_18_UIDS
+        uids = ALL_18_UIDS
+
+    manifest = None
+    if args.manifest:
+        with open(args.manifest) as f:
+            manifest = json.load(f)
+
     glbs_dir = Path(args.glbs_dir)
+    cache_dir = Path(args.cache_dir) if args.cache_dir else None
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix="voxelize_stl_"))
-    print(f"Voxelizing {len(ALL_18_UIDS)} meshes at {args.volume_size}^3")
-    print(f"GLBs: {glbs_dir}")
+    # Build work list, skipping already-voxelized and missing GLBs
+    work = []
+    skipped = 0
+    missing = 0
+    for uid in uids:
+        out_path = output_dir / f"{uid}.npy"
+        if out_path.exists():
+            skipped += 1
+            continue
+        glb_path = _resolve_glb_path(uid, manifest, glbs_dir, cache_dir)
+        if glb_path is None:
+            missing += 1
+            continue
+        work.append((uid, str(glb_path), str(output_dir), args.volume_size))
+
+    print(f"Voxelizing {len(work)} meshes at {args.volume_size}^3 "
+          f"(skipped {skipped} existing, {missing} GLB missing)")
+    print(f"Workers: {args.workers}")
     print(f"Output: {output_dir}")
-    print(f"Temp STLs: {tmp_dir}")
 
+    t0 = time.time()
     success = 0
-    for i, uid in enumerate(ALL_18_UIDS):
-        glb_path = glbs_dir / f"{uid}.glb"
-        if not glb_path.exists():
-            print(f"  [{i+1}/{len(ALL_18_UIDS)}] MISSING: {uid}")
-            continue
+    failed_uids = []
+    processed = 0
 
-        stl_path = tmp_dir / f"{uid}.stl"
-
-        # Step 1: Blender normalizes and exports STL
-        ok = normalize_with_blender(str(glb_path), str(stl_path))
-        if not ok or not stl_path.exists():
-            print(f"  [{i+1}/{len(ALL_18_UIDS)}] BLENDER FAILED: {uid}")
-            continue
-
-        try:
-            # Step 2: Load STL (coordinates already in Blender Z-up, normalized)
-            mesh = trimesh.load(str(stl_path))
-            if isinstance(mesh, trimesh.Scene):
-                mesh = mesh.to_geometry()
-
-            grid = voxelize_mesh(mesh, args.volume_size)
-            filled = grid.sum()
-            total = grid.size
-            pct = 100.0 * filled / total
-
-            out_path = output_dir / f"{uid}.npy"
-            np.save(out_path, grid)
-            print(f"  [{i+1}/{len(ALL_18_UIDS)}] {uid}: "
-                  f"{int(filled)}/{total} voxels filled ({pct:.1f}%)")
+    def _handle_result(uid, status, pct):
+        nonlocal success, processed
+        processed += 1
+        if status == "ok":
             success += 1
-        except Exception as e:
-            print(f"  [{i+1}/{len(ALL_18_UIDS)}] VOXELIZE FAILED {uid}: {e}")
+        elif status != "skip":
+            failed_uids.append(uid)
+            if len(failed_uids) <= 50:
+                print(f"  FAIL {uid[:12]}.. {status}", flush=True)
 
-    print(f"\nDone: {success}/{len(ALL_18_UIDS)} voxelized")
+        if processed % 50 == 0 or processed == len(work):
+            elapsed = time.time() - t0
+            rate = processed / max(elapsed, 1)
+            eta = (len(work) - processed) / max(rate, 0.01)
+            print(f"  [{processed}/{len(work)}] ok={success} fail={len(failed_uids)} "
+                  f"({elapsed:.0f}s elapsed, ETA {eta:.0f}s)", flush=True)
+
+    if args.workers <= 1:
+        for w in work:
+            uid, status, pct = _process_one(w)
+            _handle_result(uid, status, pct)
+    else:
+        with ProcessPoolExecutor(max_workers=args.workers) as exe:
+            futures = {exe.submit(_process_one, w): w[0] for w in work}
+            for future in as_completed(futures):
+                uid_key = futures[future]
+                try:
+                    uid, status, pct = future.result()
+                    _handle_result(uid, status, pct)
+                except Exception as e:
+                    _handle_result(uid_key, f"executor_error: {e}", 0.0)
+
+    elapsed = time.time() - t0
+    print(f"\nDone: {success}/{len(work)} voxelized in {elapsed:.0f}s "
+          f"(+{skipped} already existed)", flush=True)
+
+    if failed_uids:
+        fail_path = output_dir / "failed.txt"
+        fail_path.write_text("\n".join(failed_uids) + "\n")
+        print(f"Failed UIDs ({len(failed_uids)}) written to {fail_path}")
 
 
 if __name__ == "__main__":
