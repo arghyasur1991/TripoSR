@@ -1,7 +1,7 @@
 # MVRecon: Lightweight Multi-View 3D Object Reconstruction
 
-**Date**: 2026-04-10
-**Status**: Architecture v2 validated; full-dataset training pending (4,982 objects, 100 epochs)
+**Date**: 2026-04-10 (updated)
+**Status**: Architecture v3 (5.6M params) deployed; overfit training in progress (target IoU 0.95); Quest 3 measured at 7.5s
 **Context**: On-device 3D reconstruction for Meta Quest 3 room scanning
 
 ---
@@ -42,7 +42,7 @@ This eliminates the transformer decoder, the triplane representation, and the Ne
 
 ## 2. Architecture
 
-### 2.1 Overview (v2)
+### 2.1 Overview (v3)
 
 ```
 Input: N views × 160×160 RGB + N × 4×4 camera-to-world matrices
@@ -58,7 +58,7 @@ Input: N views × 160×160 RGB + N × 4×4 camera-to-world matrices
   │
   ├─ CoarseToFineRefiner (3D CNN, groups=4)
   │    16³ → 32³ → 64³ progressive refinement
-  │    → 32ch × 64×64×64
+  │    → 64ch × 64×64×64
   │
   └─ OccupancyColorHead
        → 1ch × 64³ density logits
@@ -98,44 +98,42 @@ The mean+variance fusion (added in v2) replaces simple averaging. The variance c
 
 The result is a 256×32×32×32 feature volume. The operation is fully differentiable and batched — no Python loops over views or voxels.
 
-#### CoarseToFineRefiner (1.4M params)
+#### CoarseToFineRefiner (4.7M params)
 
 Progressive 3D refinement using grouped convolutions (groups=4):
 
 | Stage | Resolution | Channels | Blocks | Operation |
 |-------|-----------|----------|--------|-----------|
-| 1 | 32³ → 16³ | 256 | 1 | AvgPool + GroupedResBlock |
-| 2 | 16³ → 32³ | 512 → 128 | 2 | Trilinear upsample + skip concat + 1×1 proj + 2× GroupedResBlock |
-| 3 | 32³ → 64³ | 128 → 32 | 1 | Trilinear upsample + 1×1 proj + GroupedResBlock |
+| 1 | 32³ → 16³ | 256 | 2 | AvgPool + 2× GroupedResBlock |
+| 2 | 16³ → 32³ | 512 → 256 | 3 | Trilinear upsample + skip concat + 1×1 proj + 3× GroupedResBlock |
+| 3 | 32³ → 64³ | 256 → 64 | 2 | Trilinear upsample + 1×1 proj + 2× GroupedResBlock |
 
-The coarse stage captures global structure at 16³ with the full 256-channel mean+variance volume. Stage 2 is the workhorse — it gets 2 res blocks and a skip connection from the input volume, operating at the native unprojection resolution. The fine stage adds surface detail at 64³.
+The coarse stage captures global structure at 16³ with two passes over the full 256-channel mean+variance volume. Stage 2 is the workhorse — it gets 3 res blocks and a skip connection from the input volume, operating at the native unprojection resolution with the full 256ch width. The fine stage adds surface detail at 64³ with doubled channels (64ch) and two refinement blocks.
 
-**v1→v2 changes**:
-- Groups: 8 → 4 (2× more cross-channel mixing per layer)
-- Input channels: 128 → 256 (from mean+variance fusion)
-- Stage 2: 1 block → 2 blocks (where skip connection enriches features)
-- Downsampling: strided conv → AvgPool3d (simpler, no wasted params)
-- Total: 296K → 1.41M params (4.8×)
+**Evolution**:
+- v1: groups=8, 1 block per stage, 296K params
+- v2: groups=4, 2 blocks at stage 2, 128ch stage 2, 32ch stage 3, 1.41M params
+- v3: groups=4, 2/3/2 blocks, 256ch stage 2, 64ch stage 3, 4.69M params (3.3× v2)
 
-#### OccupancyColorHead (0.002M params)
+#### OccupancyColorHead (0.009M params)
 
-Two tiny branches from the 32ch refined volume:
-- **Density**: 32→32→1 (Conv3d 1×1, GELU, Conv3d 1×1). Bias initialized to -5.0 (sigmoid(-5)≈0.007 — mostly empty at start)
-- **Color**: 32→32→3 (Conv3d 1×1, GELU, Conv3d 1×1). Sigmoid applied for RGB
+Two tiny branches from the 64ch refined volume:
+- **Density**: 64→64→1 (Conv3d 1×1, GELU, Conv3d 1×1). Bias initialized to -5.0 (sigmoid(-5)≈0.007 — mostly empty at start)
+- **Color**: 64→64→3 (Conv3d 1×1, GELU, Conv3d 1×1). Sigmoid applied for RGB
 
-**v1→v2 change**: Intermediate channels doubled (16→32) for slightly more capacity.
+**Evolution**: v1: 16ch intermediate → v2: 32ch → v3: 64ch (matches richer stage 3 output).
 
 ### 2.3 Parameter Count
 
-| Component | v1 Params | v2 Params | Change |
-|-----------|-----------|-----------|--------|
-| FeatureEncoder | 199,864 | 892,192 | +692K (pretrained layers) |
-| GeometricUnprojector | 0 | 0 | — |
-| CoarseToFineRefiner | 296,224 | 1,413,984 | +1.1M (wider, deeper) |
-| OccupancyColorHead | 1,124 | 2,244 | +1.1K |
-| **Total** | **497,212 (0.5M)** | **2,308,420 (2.3M)** | **4.6×** |
+| Component | v1 Params | v2 Params | v3 Params |
+|-----------|-----------|-----------|-----------|
+| FeatureEncoder | 199,864 | 892,192 | 892,192 |
+| GeometricUnprojector | 0 | 0 | 0 |
+| CoarseToFineRefiner | 296,224 | 1,413,984 | 4,690,496 |
+| OccupancyColorHead | 1,124 | 2,244 | 8,580 |
+| **Total** | **497,212 (0.5M)** | **2,308,420 (2.3M)** | **5,591,268 (5.6M)** |
 
-v2 is still **181× smaller** than TripoSR (419M) and **22× smaller** than the distilled student (50M). Quest inference estimated at 6–7s (within 10s budget, vs 1.5s for v1).
+v3 is **75× smaller** than TripoSR (419M) and **9× smaller** than the distilled student (50M). Quest 3 inference measured at **7.5s** (within 10s budget).
 
 ---
 
@@ -251,13 +249,17 @@ After overfit training on 11 objects, we tested on 7 **unseen** objects from the
 
 ### 4.1 ONNX Export
 
-Exported via `torch.onnx.export` (opset 18) with static shapes:
+Exported via `torch.onnx.export` (**opset 21**) with static shapes:
 - Input images: `[1, 3, 3, 160, 160]` (batch=1, 3 views)
-- Input cameras: `[1, 3, 4, 4]`
+- Input cameras: `[1, 3, 3, 4]` (pre-computed w2c_cv, not c2w)
 - Output density: `[1, 1, 64, 64, 64]`
 - Output color: `[1, 3, 64, 64, 64]`
 
-**Critical fix**: `torch.onnx.export` silently stored weights in a `.data` sidecar file. The export script now re-saves with `onnx.save_model(save_as_external_data=False)` to embed all weights inline. Final model: **2.8 MB** self-contained `.onnx`.
+**Opset 21 is required**: Earlier opsets decompose `nn.GroupNorm` on 5D tensors (from 3D convolutions) into `InstanceNormalization`, which is only defined for 4D inputs. This produces incorrect normalization statistics. Opset 21 uses the native `GroupNormalization` ONNX op which correctly handles 5D tensors.
+
+**Weight embedding**: `torch.onnx.export` may store weights in a `.data` sidecar file. The export script re-saves with `onnx.save_model(save_as_external_data=False)` to embed all weights inline. Final v3 model: **22 MB** self-contained `.onnx`.
+
+**`ExportableModel` wrapper**: The ONNX model accepts pre-computed `w2c_cv` (OpenCV world-to-camera, 3×4) instead of Blender `c2w` (4×4). This eliminates `torch.linalg.inv` from the graph — the matrix inverse is performed in C# before inference.
 
 ### 4.2 Unity Integration
 
@@ -275,21 +277,28 @@ Unity C# pipeline (`OrtMVReconModel.cs`):
 
 ### 4.3 Quest 3 Performance
 
-v1 (0.5M params) was **measured at 1.5 seconds end-to-end** on Quest 3. v2 (2.3M params) is estimated at **6–7 seconds** based on 4.6× parameter increase and heavier 3D convolutions, still within the 10-second budget. Quest measurement pending after full training completion.
+All measurements on Quest 3 with FP32 model, CPU/XNNPACK Execution Provider:
 
-| Metric | MVRecon v1 | MVRecon v2 (est.) | TripoSR (pruned QDQ 384) |
-|--------|-----------|-------------------|--------------------------|
-| E2E latency | 1.5s | **~6–7s** | 54s |
-| Model size | 2.8 MB | **~9 MB** | ~170 MB |
-| Input | 3 views × 160px | 3 views × 160px | 1 view × 384px |
-| Output | 64³ occupancy | 64³ occupancy | Triplane → NeRF decoder |
-| Parameters | 0.5M | **2.3M** | ~50M |
+| Metric | MVRecon v1 | MVRecon v2 | MVRecon v3 | TripoSR (pruned QDQ 384) |
+|--------|-----------|-----------|-----------|--------------------------|
+| E2E latency | 1.5s | 1.9–2.2s | **7.5s** | 54s |
+| Model size | 2.8 MB | 9.5 MB | **22 MB** | ~170 MB |
+| Parameters | 0.5M | 2.3M | **5.6M** | ~50M |
+| Input | 3 views × 160px | 3 views × 160px | 3 views × 160px | 1 view × 384px |
+| Output | 64³ occupancy | 64³ occupancy | 64³ occupancy | Triplane → NeRF decoder |
 
-v2 compared to TripoSR:
-- **~8× faster** than the deployed TripoSR pipeline
-- **Within 10-second** interactive target
-- **~19× smaller** model file
-- **~22× fewer** parameters
+v3 compared to TripoSR:
+- **7.2× faster** than the deployed TripoSR pipeline
+- **Within 10-second** interactive target (2.5s headroom)
+- **~8× smaller** model file
+- **~9× fewer** parameters
+
+### 4.4 Quest Model Caching
+
+On Android, ONNX models are copied from the APK's StreamingAssets to `persistentDataPath` on first access. ORT also creates an optimized graph cache (`ort_opt_cache/`). Cache invalidation:
+- **Dev builds** (`Debug.isDebugBuild`): All caches cleared on every app startup
+- **Release builds**: Caches cleared when `Application.version + buildGUID` changes
+- **ORT opt cache**: Keyed by MD5 hash of model content (first 64KB + file length), so different model weights never share stale optimized graphs
 
 ---
 
@@ -297,16 +306,17 @@ v2 compared to TripoSR:
 
 ### 5.1 Architectural Comparison
 
-| | TripoSR (Teacher) | TripoSR-Lite (Student) | **MVRecon v2** |
+| | TripoSR (Teacher) | TripoSR-Lite (Student) | **MVRecon v3** |
 |---|---|---|---|
 | **Paradigm** | Single-view, learned prior | Single-view, distilled prior | **Multi-view, geometric fusion** |
 | **Encoder** | DINO ViT-B/16 (86M) | MobileNetV3-Large (3.7M) | MobileNetV3-Small 3-scale (0.9M) |
 | **View fusion** | N/A | N/A | **Mean+variance unprojection** |
 | **3D Representation** | Triplane (3×40×64²) | Triplane (3×40×32²) | **Voxel grid (64³)** |
-| **Decoder** | 16L Transformer (330M) + NeRF MLP | 8L Transformer (44M) + NeRF MLP | **3D CNN (1.4M), no MLP** |
+| **Decoder** | 16L Transformer (330M) + NeRF MLP | 8L Transformer (44M) + NeRF MLP | **3D CNN (4.7M), no MLP** |
 | **Camera info** | Not used | Not used | **Required (c2w matrices)** |
 | **Multi-view** | N/A (single image) | N/A (single image) | **Native (1–10 views)** |
-| **Total params** | 419M | 50M | **2.3M** |
+| **Total params** | 419M | 50M | **5.6M** |
+| **Quest 3 latency** | 54s | — | **7.5s** |
 
 ### 5.2 Why Geometric Unprojection Works
 
@@ -401,35 +411,64 @@ v1 trained successfully on 11 overfit objects (IoU 0.82) but **failed to general
 
 ---
 
-## 9. Future Work
+## 9. v2 → v3 Changelog
 
-### 9.1 Full Training Evaluation (Pending)
+v2 overfit training (10 objects, 1000 epochs with augmentation) reached IoU 0.78 at epoch 880 — well below the 0.95 target. Quest performance was 1.9–2.2s, leaving ~8s of headroom within the 10s budget. Diagnosis: Stage 3 at 64³ with only 32ch was the primary bottleneck — the head was making per-voxel decisions from too few features to resolve fine surface detail.
 
-100-epoch v2 training on 4,484 train objects (498 val) with early stopping. Key metrics to track:
-- Val IoU convergence and comparison to v1's plateau at ~0.34
-- Generalization: val-set mesh quality vs train-set
-- Failure modes: which object types are hardest?
-- Whether the 2.3M model's additional capacity translates to measurably better generalization
+Strategy: **"go big, then cut"** — scale the refiner to fill the performance budget, then reduce if Quest exceeds 10s.
 
-### 9.2 Quest Deployment with Trained Model
+| Change | v2 | v3 | Rationale |
+|--------|----|----|-----------|
+| **Stage 1 blocks** | 1 | **2** | Cheap at 16³, improves global structure understanding |
+| **Stage 2 channels** | 128 | **256** | Doubles capacity at the workhorse stage (32³ with skip connection) |
+| **Stage 2 blocks** | 2 | **3** | More refinement passes on the skip-enriched volume |
+| **Stage 3 channels** | 32 | **64** | Highest-impact change: doubles fine-detail capacity at output resolution |
+| **Stage 3 blocks** | 1 | **2** | Adds second refinement pass for surface detail |
+| **Head channels** | 32 | **64** | Matches richer stage 3 output |
+| **Total params** | 2.3M | **5.6M** | 2.4× |
+| **Quest latency** | 1.9–2.2s | **7.5s** | Within budget (2.5s headroom) |
+| **ONNX size** | 9.5 MB | **22 MB** | FP32; FP16/INT8 variants planned |
 
-After training:
-1. Export best checkpoint to ONNX
-2. Deploy to Unity `StreamingAssets`
-3. Visual quality evaluation on Quest with diverse test objects
-4. A/B comparison with TripoSR output quality
-
-### 9.3 Potential Improvements
-
-- **Depth input**: Add Quest 3 depth sensor data as a 4th encoder channel for geometric bootstrapping
-- **Adaptive view selection**: Prioritize views with maximal angular coverage rather than random selection
-- **Higher resolution**: 128³ output with an additional refinement stage (adds ~50K params)
-- **FP16/INT8 quantization**: The 2.8MB model likely quantizes well given its simplicity
-- **QNN HTP**: If Qualcomm NPU access becomes available, inference could drop below 500ms
+Encoder and unprojector are **unchanged** — the quality bottleneck was entirely in the refiner's limited capacity at stages 2 and 3.
 
 ---
 
-## 10. References
+## 10. Future Work
+
+### 10.1 Overfit Target (In Progress)
+
+1000-epoch v3 overfit on 10 objects with augmentation. Target IoU 0.95, loss 0.005. If not reached at 1000 epochs, extend to 2000 (cosine floor is 1% of max LR, still learning).
+
+### 10.2 Full Training
+
+100-epoch v3 training on 4,484 train objects (498 val) with early stopping. Estimated ~130 min/epoch (~216 hours / 9 days total). Key metrics:
+- Val IoU convergence and comparison to v1's plateau at ~0.34
+- Generalization gap (train vs val IoU)
+- Failure modes: which object types are hardest?
+
+### 10.3 Quantization & Size Reduction
+
+| Variant | Method | Expected size | Notes |
+|---|---|---|---|
+| FP32 | Current | 22 MB | Baseline |
+| FP16 | `onnxconverter-common` | ~11 MB | Usually no quality loss |
+| INT8 dynamic | `onnxruntime.quantization` | ~6 MB | Slight quality loss, fastest on CPU |
+| INT8 QDQ | `onnxruntime.quantization` + calibration | ~6 MB | Better accuracy than dynamic INT8 |
+
+### 10.4 Architecture Scaling (if needed)
+
+If Quest 3 performance allows, v3-B (fallback) drops Stage 2 from 256→192ch for ~5s Quest inference. If quality is insufficient, the encoder could be upgraded (MobileNetV3-Large) or input resolution increased (224px).
+
+### 10.5 Other Improvements
+
+- **Depth input**: Add Quest 3 depth sensor data as a 4th encoder channel for geometric bootstrapping
+- **Adaptive view selection**: Prioritize views with maximal angular coverage rather than random selection
+- **Higher resolution**: 128³ output with an additional refinement stage
+- **QNN HTP**: If Qualcomm NPU access becomes available, inference could drop below 2s
+
+---
+
+## 11. References
 
 - **TripoSR**: Tochilkin et al., 2024. "TripoSR: Fast 3D Object Reconstruction from a Single Image." MIT License.
 - **LRM**: Hong et al., ICLR 2024. "Large Reconstruction Model for Single Image to 3D."
@@ -470,19 +509,21 @@ python -u -m mv_recon.train \
   --epochs 1000 --lr 1e-3 --warmup_epochs 5 \
   --n_rays_per_view 1024 --n_samples 64 --sup_image_size 128
 
-# Full training v2 (100 epochs, ~48 hours on M4 Max)
-python -u -m mv_recon.train \
+# Full training v3 (100 epochs, ~216 hours on M4 Max)
+nohup /Users/sur/miniconda3/bin/python -u -m mv_recon.train \
   --mode full --data_dir ~/Downloads/mv_recon_data \
   --uids_file filtered_uids.json \
   --epochs 100 --val_every 2 --lr 1e-3 --warmup_epochs 5 \
-  --grad_accum 8 --early_stop 20 --augment
+  --grad_accum 8 --early_stop 20 --augment \
+  > output/train_full_v3.log 2>&1 &
 
 # Extract meshes
 python -u -m mv_recon.extract_mesh \
   --checkpoint output/mv_recon_overfit/<run>/checkpoints/best.pt \
   --volume_size 32
 
-# Export ONNX
+# Export ONNX (must use opset 21 for GroupNormalization)
 python -u -m mv_recon.export_onnx_v2 \
-  --checkpoint output/mv_recon_overfit/<run>/checkpoints/best.pt
+  --checkpoint output/mv_recon_overfit/<run>/checkpoints/best.pt \
+  --opset 21
 ```
