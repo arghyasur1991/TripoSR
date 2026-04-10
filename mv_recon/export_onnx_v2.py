@@ -281,37 +281,139 @@ def write_camera_config(output_dir: str, input_size: int = 160):
     print(f"Camera config: {out_path}")
 
 
+def convert_fp16(fp32_path: str, fp16_path: str):
+    """Convert FP32 ONNX model to mixed-precision FP16.
+
+    Uses onnx float16 converter with op_block_list to keep ops that are
+    numerically sensitive (normalization, reductions) in FP32.
+    """
+    from onnxconverter_common import float16
+    import onnx
+
+    print(f"\nConverting to FP16: {fp16_path}")
+    model = onnx.load(fp32_path)
+    model_fp16 = float16.convert_float_to_float16(
+        model,
+        keep_io_types=True,
+        disable_shape_infer=True,
+        op_block_list=['GroupNormalization', 'ReduceMean', 'GridSample'],
+    )
+    onnx.save_model(model_fp16, fp16_path, save_as_external_data=False)
+    size_mb = Path(fp16_path).stat().st_size / (1024 * 1024)
+    print(f"FP16 exported: {fp16_path} ({size_mb:.1f} MB)")
+    return fp16_path
+
+
+def quantize_int8(fp32_path: str, int8_path: str):
+    """Dynamic INT8 quantization of ONNX model."""
+    from onnxruntime.quantization import quantize_dynamic, QuantType
+
+    print(f"\nQuantizing to INT8 (dynamic): {int8_path}")
+    quantize_dynamic(
+        fp32_path, int8_path,
+        weight_type=QuantType.QUInt8,
+        extra_options={"MatMulConstBOnly": False},
+    )
+    size_mb = Path(int8_path).stat().st_size / (1024 * 1024)
+    print(f"INT8 exported: {int8_path} ({size_mb:.1f} MB)")
+    return int8_path
+
+
+def verify_variant(variant_path: str, ref_model: ExportableModel,
+                   label: str, n_views: int = 3, input_size: int = 160,
+                   tol: float = 0.05):
+    """Verify a quantized variant against PyTorch reference."""
+    import onnxruntime as ort
+
+    device = next(ref_model.parameters()).device
+    ref_model.eval()
+
+    torch.manual_seed(42)
+    dummy_images = torch.randn(1, n_views, 3, input_size, input_size, device=device)
+    dummy_w2c = torch.randn(1, n_views, 3, 4, device=device)
+
+    with torch.no_grad():
+        pt_density, pt_color = ref_model(dummy_images, dummy_w2c)
+
+    sess = ort.InferenceSession(variant_path, providers=['CPUExecutionProvider'])
+    ort_out = sess.run(None, {
+        'images': dummy_images.cpu().numpy(),
+        'w2c_cv': dummy_w2c.cpu().numpy(),
+    })
+
+    d_diff = np.abs(pt_density.cpu().numpy() - ort_out[0]).max()
+    c_diff = np.abs(pt_color.cpu().numpy() - ort_out[1]).max()
+
+    print(f"[{label}] density max diff: {d_diff:.6f}, color max diff: {c_diff:.6f}")
+    ok = d_diff < tol and c_diff < tol
+    print(f"[{label}] {'PASS' if ok else 'FAIL'}: tolerance {tol}")
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser(description="Export MVRecon to ONNX")
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to best.pt checkpoint')
+    parser.add_argument('--output_dir', type=str, default=None,
+                        help='Output directory (default: same dir as checkpoint)')
     parser.add_argument('--output', type=str, default=None,
-                        help='Output ONNX path (default: same dir as checkpoint)')
+                        help='Output ONNX path (overrides output_dir for FP32)')
     parser.add_argument('--n_views', type=int, default=3)
     parser.add_argument('--input_size', type=int, default=160)
     parser.add_argument('--opset', type=int, default=21)
     parser.add_argument('--skip_verify', action='store_true')
+    parser.add_argument('--variants', nargs='+',
+                        choices=['fp32', 'fp16', 'int8', 'all'],
+                        default=['fp32'],
+                        help='Which precision variants to export')
     args = parser.parse_args()
 
+    if 'all' in args.variants:
+        args.variants = ['fp32', 'fp16', 'int8']
+
     ckpt_dir = Path(args.checkpoint).parent.parent
-    output_dir = ckpt_dir if args.output is None else Path(args.output).parent
-    output_path = args.output or str(ckpt_dir / 'mv_recon.onnx')
+    output_dir = Path(args.output_dir) if args.output_dir else ckpt_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    fp32_path = args.output or str(output_dir / 'mv_recon_fp32.onnx')
 
     print(f"Loading checkpoint: {args.checkpoint}")
     trained = load_model(args.checkpoint)
     exportable = ExportableModel(trained)
 
+    # Always export FP32 first (needed as base for other variants)
     print("\nModel info:")
-    export_onnx(exportable, output_path, args.n_views, args.input_size, args.opset)
-
-    print_model_info(exportable, output_path)
+    export_onnx(exportable, fp32_path, args.n_views, args.input_size, args.opset)
+    print_model_info(exportable, fp32_path)
     write_camera_config(str(output_dir), args.input_size)
 
     if not args.skip_verify:
-        print("\nVerifying ONNX vs PyTorch...")
-        verify_onnx(output_path, exportable, args.n_views, args.input_size)
+        print("\nVerifying FP32 ONNX vs PyTorch...")
+        verify_onnx(fp32_path, exportable, args.n_views, args.input_size)
 
-    print(f"\nDone. ONNX model: {output_path}")
+    exported = {'fp32': fp32_path}
+
+    if 'fp16' in args.variants:
+        fp16_path = str(output_dir / 'mv_recon_fp16.onnx')
+        convert_fp16(fp32_path, fp16_path)
+        exported['fp16'] = fp16_path
+        # FP16 mixed-precision models can't be verified on CPU provider
+        # (internal Cast node type mismatches). Verify on Quest with XNNPACK.
+        print("[FP16] Skipping CPU verification — test on device (XNNPACK EP)")
+
+    if 'int8' in args.variants:
+        int8_path = str(output_dir / 'mv_recon_int8.onnx')
+        quantize_int8(fp32_path, int8_path)
+        exported['int8'] = int8_path
+        if not args.skip_verify:
+            verify_variant(int8_path, exportable, 'INT8',
+                           args.n_views, args.input_size, tol=0.5)
+
+    print("\n=== Export Summary ===")
+    for variant, path in exported.items():
+        size_mb = Path(path).stat().st_size / (1024 * 1024)
+        print(f"  {variant.upper():5s}: {path} ({size_mb:.1f} MB)")
+    print("Done.")
 
 
 if __name__ == '__main__':
