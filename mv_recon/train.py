@@ -115,18 +115,33 @@ def split_train_val(uids: list[str], val_ratio: float = 0.1,
     return shuffled[n_val:], shuffled[:n_val]
 
 
+def focal_bce_loss(pred_logits: torch.Tensor, gt: torch.Tensor,
+                   gamma: float = 2.0, alpha: float = 0.75) -> torch.Tensor:
+    """Focal loss for binary occupancy — down-weights easy examples.
+
+    Unlike pos_weighted BCE, focal loss doesn't systematically bias toward
+    over-prediction on small objects. Alpha balances pos/neg classes;
+    gamma suppresses easy-negative gradients that dominate sparse volumes.
+    """
+    p = torch.sigmoid(pred_logits)
+    bce = F.binary_cross_entropy_with_logits(pred_logits, gt, reduction='none')
+    focal_weight = gt * (1 - p) ** gamma * alpha + (1 - gt) * p ** gamma * (1 - alpha)
+    return (focal_weight * bce).mean()
+
+
 def compute_loss(model: MVReconModel, batch: dict,
                  device: torch.device,
                  K_sup: torch.Tensor,
                  n_samples: int = 64, n_rays_per_view: int = 512,
                  sup_image_size: int = 128,
                  w_photo: float = 1.0, w_mask: float = 0.1,
-                 w_bce: float = 1.0, w_sparse: float = 0.02,
+                 w_bce: float = 1.0, w_sparse: float = 0.1,
+                 focal_gamma: float = 2.0, focal_alpha: float = 0.75,
                  ) -> tuple[torch.Tensor, dict]:
-    """Hybrid loss: photometric + mask + 3D BCE + sparsity.
+    """Hybrid loss: photometric + mask + 3D focal BCE + sparsity.
 
     Photometric and mask losses use the learned color volume for gradients.
-    3D BCE loss provides direct geometry supervision from GT voxels.
+    Focal BCE provides geometry supervision without over-prediction bias.
     Sparsity loss penalizes over-prediction of occupied voxels.
     """
     input_imgs = batch['input_images'].to(device)    # [B, V_in, 3, H, W]
@@ -159,20 +174,15 @@ def compute_loss(model: MVReconModel, batch: dict,
     photo_loss = total_photo / B
     mask_loss = total_mask / B
 
-    # Direct 3D BCE loss — model outputs 64^3, GT is 64^3
+    # Direct 3D focal BCE loss — model outputs 64^3, GT is 64^3
     bce_loss = torch.tensor(0.0, device=device)
     iou_val = 0.0
     pred_logits = density[:, 0]                      # [B, 64, 64, 64]
     if 'gt_occupancy' in batch:
         gt_occ = batch['gt_occupancy'].to(device)    # [B, 64, 64, 64]
 
-        n_pos = gt_occ.sum().clamp(min=1.0)
-        n_neg = (1 - gt_occ).sum().clamp(min=1.0)
-        pos_weight = (n_neg / n_pos).clamp(max=20.0)
-
-        bce_loss = F.binary_cross_entropy_with_logits(
-            pred_logits, gt_occ, pos_weight=pos_weight,
-        )
+        bce_loss = focal_bce_loss(pred_logits, gt_occ,
+                                  gamma=focal_gamma, alpha=focal_alpha)
         with torch.no_grad():
             iou_val = _iou(torch.sigmoid(pred_logits) > 0.5,
                            gt_occ > 0.5).item()
@@ -214,6 +224,9 @@ def validate(model: MVReconModel, val_loader: DataLoader,
             n_samples=args.n_samples,
             n_rays_per_view=args.n_rays_per_view,
             sup_image_size=args.sup_image_size,
+            w_sparse=args.w_sparse,
+            focal_gamma=args.focal_gamma,
+            focal_alpha=args.focal_alpha,
         )
         for k, v in metrics.items():
             totals[k] = totals.get(k, 0) + v
@@ -384,6 +397,9 @@ def train(args):
                 n_samples=args.n_samples,
                 n_rays_per_view=args.n_rays_per_view,
                 sup_image_size=args.sup_image_size,
+                w_sparse=args.w_sparse,
+                focal_gamma=args.focal_gamma,
+                focal_alpha=args.focal_alpha,
             )
             (loss / grad_accum).backward()
 
@@ -523,7 +539,13 @@ def main():
     parser.add_argument('--warmup_epochs', type=int, default=5,
                         help='Linear LR warmup epochs before cosine decay')
     parser.add_argument('--augment', action='store_true', default=None,
-                        help='Force augmentation on (default: auto, on for full mode)')
+                        help='Force augmentation on (default: off for overfit, on for full)')
+    parser.add_argument('--w_sparse', type=float, default=0.1,
+                        help='Sparsity loss weight (penalizes mean occupancy)')
+    parser.add_argument('--focal_gamma', type=float, default=2.0,
+                        help='Focal loss gamma (higher = more focus on hard examples)')
+    parser.add_argument('--focal_alpha', type=float, default=0.75,
+                        help='Focal loss alpha (positive class weight, 0.5=balanced)')
     args = parser.parse_args()
     train(args)
 

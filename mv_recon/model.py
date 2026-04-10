@@ -163,48 +163,42 @@ class CoarseToFineRefiner(nn.Module):
     """Progressive 3D refinement: 16^3 -> 32^3 -> 64^3.
 
     Input: 32^3 feature volume (256ch from mean+variance fusion).
-    Stage 1: Pool to 16^3, 256ch, 2 res blocks (coarse global structure)
-    Stage 2: Upsample to 32^3, concat skip, project to 256ch, 3 res blocks
-    Stage 3: Upsample to 64^3, project to 64ch, 2 res blocks (fine detail)
+    Stage 1: Pool to 16^3, 256ch, 1 res block (coarse global structure)
+    Stage 2: Upsample to 32^3, concat skip, project to 128ch, 2 res blocks
+    Stage 3: Upsample to 64^3, project to 32ch, 1 res block (fine detail)
     """
 
-    def __init__(self, in_channels: int = 256, mid_channels: int = 256,
-                 out_channels: int = 64, groups: int = 4):
+    def __init__(self, in_channels: int = 256, mid_channels: int = 128,
+                 out_channels: int = 32, groups: int = 4):
         super().__init__()
         self.down = nn.AvgPool3d(2)
-        self.stage1a = GroupedResBlock3D(in_channels, groups)
-        self.stage1b = GroupedResBlock3D(in_channels, groups)
+        self.stage1 = GroupedResBlock3D(in_channels, groups)
 
         self.up1_proj = nn.Conv3d(in_channels * 2, mid_channels, 1)
         self.stage2a = GroupedResBlock3D(mid_channels, groups)
         self.stage2b = GroupedResBlock3D(mid_channels, groups)
-        self.stage2c = GroupedResBlock3D(mid_channels, groups)
 
         self.up2_proj = nn.Conv3d(mid_channels, out_channels, 1)
-        self.stage3a = GroupedResBlock3D(out_channels, groups)
-        self.stage3b = GroupedResBlock3D(out_channels, groups)
+        self.stage3 = GroupedResBlock3D(out_channels, groups)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B, 256, 32, 32, 32] -> [B, 64, 64, 64, 64]."""
+        """x: [B, 256, 32, 32, 32] -> [B, 32, 64, 64, 64]."""
         skip_32 = x
 
         h = self.down(x)                                       # [B, 256, 16, 16, 16]
-        h = self.stage1a(h)                                    # [B, 256, 16, 16, 16]
-        h = self.stage1b(h)                                    # [B, 256, 16, 16, 16]
+        h = self.stage1(h)                                     # [B, 256, 16, 16, 16]
 
         h = F.interpolate(h, scale_factor=2, mode='trilinear',
                           align_corners=False)                 # [B, 256, 32, 32, 32]
         h = torch.cat([h, skip_32], dim=1)                    # [B, 512, 32, 32, 32]
-        h = self.up1_proj(h)                                   # [B, 256, 32, 32, 32]
-        h = self.stage2a(h)                                    # [B, 256, 32, 32, 32]
-        h = self.stage2b(h)                                    # [B, 256, 32, 32, 32]
-        h = self.stage2c(h)                                    # [B, 256, 32, 32, 32]
+        h = self.up1_proj(h)                                   # [B, 128, 32, 32, 32]
+        h = self.stage2a(h)                                    # [B, 128, 32, 32, 32]
+        h = self.stage2b(h)                                    # [B, 128, 32, 32, 32]
 
         h = F.interpolate(h, scale_factor=2, mode='trilinear',
-                          align_corners=False)                 # [B, 256, 64, 64, 64]
-        h = self.up2_proj(h)                                   # [B, 64, 64, 64, 64]
-        h = self.stage3a(h)                                    # [B, 64, 64, 64, 64]
-        h = self.stage3b(h)                                    # [B, 64, 64, 64, 64]
+                          align_corners=False)                 # [B, 128, 64, 64, 64]
+        h = self.up2_proj(h)                                   # [B, 32, 64, 64, 64]
+        h = self.stage3(h)                                     # [B, 32, 64, 64, 64]
 
         return h
 
