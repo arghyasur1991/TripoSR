@@ -142,7 +142,8 @@ class ObjaverseMultiViewDataset(Dataset):
                 transforms.functional.resize(rgb, (self.image_size, self.image_size))
             )
             if self.augment and random.random() < 0.3:
-                t = t + torch.randn_like(t) * 0.01
+                sigma = random.uniform(0.04, 0.08)
+                t = t + torch.randn_like(t) * sigma
                 t = t.clamp(0, 1)
             t = self.imagenet_normalize(t)
             input_images.append(t)

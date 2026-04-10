@@ -249,7 +249,7 @@ def train(args):
         n_sup_views=args.n_sup_views,
         image_size=args.image_size,
         sup_image_size=args.sup_image_size,
-        augment=(args.mode != 'overfit'),
+        augment=args.augment if args.augment is not None else (args.mode != 'overfit'),
         voxels_dir=voxels_dir,
     )
     train_loader = DataLoader(
@@ -511,6 +511,8 @@ def main():
                         help='Gradient accumulation steps')
     parser.add_argument('--early_stop', type=int, default=50,
                         help='Stop if val IoU stalls for N epochs (0=disabled)')
+    parser.add_argument('--augment', action='store_true', default=None,
+                        help='Force augmentation on (default: auto, on for full mode)')
     args = parser.parse_args()
     train(args)
 
