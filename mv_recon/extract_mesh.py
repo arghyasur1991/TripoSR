@@ -255,7 +255,9 @@ def extract(args):
     ).to(device)
 
     ckpt_path = Path(args.checkpoint)
-    if ckpt_path.parent.name == 'checkpoints':
+    if args.meshes_out:
+        out_base = Path(args.meshes_out)
+    elif ckpt_path.parent.name == 'checkpoints':
         out_base = ckpt_path.parent.parent / 'meshes'
     else:
         out_base = Path(args.output_dir) / 'meshes'
@@ -349,6 +351,8 @@ def main():
                         help='Marching cubes threshold (higher = less noise)')
     parser.add_argument('--uids', type=str, default=None,
                         help='Comma-separated UIDs or JSON array (overrides --mode)')
+    parser.add_argument('--meshes_out', type=str, default=None,
+                        help='Output directory for mesh folders (default: run_dir/meshes)')
     args = parser.parse_args()
     extract(args)
 
