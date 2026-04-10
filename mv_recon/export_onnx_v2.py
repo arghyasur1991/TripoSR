@@ -328,27 +328,210 @@ def convert_fp16(fp32_path: str, fp16_path: str):
     return fp16_path
 
 
-def quantize_int8(fp32_path: str, int8_path: str):
-    """Dynamic INT8 quantization (signed, per-channel).
+class _MultiInputCalibrationReader:
+    """Feeds multi-input samples (dict per sample) to ORT static quantization."""
 
-    MVRecon is CNN-based (72 Conv ops, 0 MatMul) so we quantize both
-    MatMul and Conv. TripoSR only quantizes MatMul because its Conv
-    layers are accuracy-sensitive, but MVRecon's Conv3D layers in the
-    refiner benefit from quantization without significant quality loss.
+    def __init__(self, samples: list[dict[str, np.ndarray]]):
+        self.samples = samples
+        self.index = 0
+
+    def get_next(self):
+        if self.index >= len(self.samples):
+            return None
+        sample = self.samples[self.index]
+        self.index += 1
+        return sample
+
+
+def _collect_mvrecon_calibration_data(
+    test_dir: str, n_views: int = 3, input_size: int = 160,
+) -> list[dict[str, np.ndarray]]:
+    """Collect real calibration samples from MVRecon test objects.
+
+    Loads test images + camera poses, applies the same preprocessing as
+    training (center-crop, composite on grey bg, resize, ImageNet normalize),
+    then converts Blender c2w → OpenCV w2c for the ONNX model input format.
     """
-    from onnxruntime.quantization import quantize_dynamic, QuantType
+    from PIL import Image
+    from torchvision import transforms
 
-    print(f"\nQuantizing to INT8 (dynamic): {int8_path}")
-    quantize_dynamic(
-        fp32_path, int8_path,
-        weight_type=QuantType.QInt8,
-        per_channel=True,
-        reduce_range=False,
-        op_types_to_quantize=["MatMul", "Conv"],
-    )
+    test_path = Path(test_dir)
+    if not test_path.exists():
+        print(f"  WARNING: calibration dir not found: {test_dir}")
+        return []
+
+    imagenet_normalize = transforms.Normalize(
+        [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+
+    samples = []
+    for cam_file in sorted(test_path.glob("*/cameras.json")):
+        obj_dir = cam_file.parent
+        with open(cam_file) as f:
+            cams = json.load(f)
+
+        views = cams[:n_views]
+        imgs = []
+        c2w_list = []
+        for v in views:
+            img_path = obj_dir / v['filename']
+            if not img_path.exists():
+                break
+            img = Image.open(img_path).convert('RGBA')
+            w, h = img.size
+            sq = min(w, h)
+            left, top = (w - sq) // 2, (h - sq) // 2
+            img = img.crop((left, top, left + sq, top + sq))
+            r, g, b, a = img.split()
+            rgb = Image.merge('RGB', (r, g, b))
+            bg = Image.new('RGB', rgb.size, (127, 127, 127))
+            rgb = Image.composite(rgb, bg, a)
+            t = transforms.functional.to_tensor(
+                transforms.functional.resize(rgb, (input_size, input_size)))
+            t = imagenet_normalize(t)
+            imgs.append(t)
+            c2w_list.append(torch.tensor(v['pose'], dtype=torch.float32))
+
+        if len(imgs) < n_views:
+            continue
+
+        images = torch.stack(imgs).unsqueeze(0)  # [1, N, 3, H, W]
+        c2w = torch.stack(c2w_list).unsqueeze(0)  # [1, N, 4, 4]
+        w2c = c2w_blender_to_w2c_cv(c2w)  # [1, N, 3, 4]
+
+        samples.append({
+            'images': images.numpy().astype(np.float32),
+            'w2c_cv': w2c.numpy().astype(np.float32),
+        })
+
+    print(f"  Collected {len(samples)} calibration samples from {test_dir}")
+    return samples
+
+
+def _generate_random_calibration_data(
+    n_samples: int = 16, n_views: int = 3, input_size: int = 160,
+) -> list[dict[str, np.ndarray]]:
+    """Fallback: generate random calibration data when no test images available."""
+    samples = []
+    for i in range(n_samples):
+        torch.manual_seed(i)
+        images = torch.randn(1, n_views, 3, input_size, input_size)
+        w2c = torch.randn(1, n_views, 3, 4)
+        samples.append({
+            'images': images.numpy().astype(np.float32),
+            'w2c_cv': w2c.numpy().astype(np.float32),
+        })
+    print(f"  Generated {n_samples} random calibration samples (no test images found)")
+    return samples
+
+
+def quantize_int8_weights_only(fp32_path: str, int8_path: str):
+    """Weight-only INT8 quantization using QDQ format for ORT CPU EP.
+
+    Quantizes only Conv weight tensors to INT8 (per-channel, symmetric),
+    inserting DequantizeLinear nodes to convert back to FP32 before compute.
+    Activations stay in FP32 — no calibration data needed.
+
+    This avoids both:
+    - ConvInteger (from quantize_dynamic) which CPU EP doesn't support
+    - Activation quantization error accumulation (from quantize_static)
+      which destroys accuracy in deep CNNs (72 Conv layers)
+
+    Result: ~4x weight size reduction with near-zero accuracy loss.
+    """
+    import onnx
+    from onnx import numpy_helper, TensorProto, helper
+
+    print(f"\nQuantizing to INT8 (weight-only QDQ): {int8_path}")
+    model = onnx.load(fp32_path)
+
+    # Build lookup: initializer name → numpy array
+    init_map = {}
+    for init in model.graph.initializer:
+        init_map[init.name] = init
+
+    # Find Conv nodes and their weight input names
+    conv_weight_names = set()
+    for node in model.graph.node:
+        if node.op_type == "Conv" and len(node.input) >= 2:
+            conv_weight_names.add(node.input[1])
+
+    quantized_count = 0
+    new_initializers = []
+    nodes_to_prepend = []
+
+    for init in model.graph.initializer:
+        if init.name not in conv_weight_names:
+            new_initializers.append(init)
+            continue
+
+        arr = numpy_helper.to_array(init).astype(np.float32)
+        if arr.ndim < 3:
+            new_initializers.append(init)
+            continue
+
+        # Skip tiny output-head Conv layers (density=1ch, color=3ch) —
+        # they're most sensitive to quantization and negligible in size.
+        if arr.shape[0] <= 4:
+            new_initializers.append(init)
+            print(f"    Skipping head Conv: {init.name} (shape {arr.shape})")
+            continue
+
+        # Per-channel symmetric quantization along axis 0 (output channels)
+        out_channels = arr.shape[0]
+        scales = np.zeros(out_channels, dtype=np.float32)
+        quantized = np.zeros_like(arr, dtype=np.int8)
+
+        for c in range(out_channels):
+            channel = arr[c].flatten()
+            abs_max = max(float(np.abs(channel).max()), 1e-10)
+            scale = abs_max / 127.0
+            scales[c] = scale
+            quantized[c] = np.clip(np.round(channel / scale), -127, 127).astype(
+                np.int8).reshape(arr[c].shape)
+
+        q_name = init.name + "_quantized"
+        scale_name = init.name + "_scale"
+        zp_name = init.name + "_zero_point"
+        dq_output_name = init.name + "_dequantized"
+
+        q_tensor = numpy_helper.from_array(quantized, name=q_name)
+        scale_tensor = numpy_helper.from_array(scales, name=scale_name)
+        zp_tensor = numpy_helper.from_array(
+            np.zeros(out_channels, dtype=np.int8), name=zp_name)
+
+        new_initializers.extend([q_tensor, scale_tensor, zp_tensor])
+
+        dq_node = helper.make_node(
+            "DequantizeLinear",
+            inputs=[q_name, scale_name, zp_name],
+            outputs=[dq_output_name],
+            axis=0,
+        )
+        nodes_to_prepend.append(dq_node)
+
+        # Rewrite Conv node to use dequantized output
+        for node in model.graph.node:
+            if node.op_type == "Conv" and len(node.input) >= 2:
+                if node.input[1] == init.name:
+                    node.input[1] = dq_output_name
+
+        quantized_count += 1
+
+    # Replace initializers and prepend DequantizeLinear nodes
+    del model.graph.initializer[:]
+    model.graph.initializer.extend(new_initializers)
+
+    for n in reversed(nodes_to_prepend):
+        model.graph.node.insert(0, n)
+
+    print(f"  Quantized {quantized_count} Conv weight tensors (per-channel symmetric)")
+
+    onnx.save(model, int8_path)
+
     fp32_size = Path(fp32_path).stat().st_size / (1024 * 1024)
     int8_size = Path(int8_path).stat().st_size / (1024 * 1024)
-    print(f"INT8 exported: {int8_path} ({int8_size:.1f} MB, was {fp32_size:.1f} MB)")
+    ratio = int8_size / fp32_size * 100
+    print(f"INT8 weight-only exported: {int8_path} ({int8_size:.1f} MB, {ratio:.0f}% of FP32)")
     return int8_path
 
 
@@ -520,26 +703,26 @@ def main():
 
     if 'int8' in args.variants:
         int8_path = str(output_dir / 'mv_recon_int8.onnx')
-        quantize_int8(fp32_path, int8_path)
+        quantize_int8_weights_only(fp32_path, int8_path)
+        validate_static_shapes(int8_path)
         exported['int8'] = int8_path
         if not args.skip_verify:
-            try:
-                results.append(verify_variant(
-                    int8_path, ref_d, ref_c, img_np, w2c_np, 'INT8'))
-            except Exception as e:
-                print(f"[INT8] CPU verification failed ({e}) — test on device")
+            results.append(verify_variant(
+                int8_path, ref_d, ref_c, img_np, w2c_np, 'INT8 QDQ'))
 
     # Summary table
+    label_map = {'fp32': 'FP32', 'fp16': 'FP16', 'int8': 'INT8 QDQ'}
     print("\n=== Export Summary ===")
-    print(f"{'Variant':<8} {'Size':>8} {'Max Rel%':>10} {'Verdict':>8}")
-    print("-" * 38)
+    print(f"{'Variant':<10} {'Size':>8} {'Max Rel%':>10} {'Verdict':>8}")
+    print("-" * 40)
     for variant, path in exported.items():
         size_mb = Path(path).stat().st_size / (1024 * 1024)
-        r = next((x for x in results if x['label'] == variant.upper()), None)
+        lbl = label_map.get(variant, variant.upper())
+        r = next((x for x in results if x['label'] == lbl), None)
         if r:
-            print(f"  {variant.upper():<6} {size_mb:>7.1f}MB {r['max_rel']*100:>9.3f}% {r['verdict']:>8}")
+            print(f"  {lbl:<8} {size_mb:>7.1f}MB {r['max_rel']*100:>9.3f}% {r['verdict']:>8}")
         else:
-            print(f"  {variant.upper():<6} {size_mb:>7.1f}MB {'':>9} {'N/A':>8}")
+            print(f"  {lbl:<8} {size_mb:>7.1f}MB {'':>9} {'N/A':>8}")
     print("Done.")
 
 
