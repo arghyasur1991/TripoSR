@@ -249,6 +249,7 @@ def train(args):
         n_sup_views=args.n_sup_views,
         image_size=args.image_size,
         sup_image_size=args.sup_image_size,
+        augment=(args.mode != 'overfit'),
         voxels_dir=voxels_dir,
     )
     train_loader = DataLoader(
