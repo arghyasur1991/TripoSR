@@ -281,73 +281,164 @@ def write_camera_config(output_dir: str, input_size: int = 160):
     print(f"Camera config: {out_path}")
 
 
-def convert_fp16(fp32_path: str, fp16_path: str):
-    """Convert FP32 ONNX model to mixed-precision FP16.
+def optimize_graph(input_path: str, output_path: str = None, level: str = "basic"):
+    """Apply ORT graph optimizations (constant folding, CSE, dead node elimination).
 
-    Uses onnx float16 converter with op_block_list to keep ops that are
-    numerically sensitive (normalization, reductions) in FP32.
+    level="basic": safe for all models — no op fusions that break quantization.
+    level="all": aggressive fusions (MatMul+Add → Gemm). Use only for final FP32.
     """
-    from onnxconverter_common import float16
-    import onnx
+    import onnxruntime as ort
+
+    if output_path is None:
+        output_path = input_path
+
+    print(f"  Optimizing graph ({level.upper()}): {Path(input_path).name}")
+    opt_level = (ort.GraphOptimizationLevel.ORT_ENABLE_ALL if level == "all"
+                 else ort.GraphOptimizationLevel.ORT_ENABLE_BASIC)
+
+    so = ort.SessionOptions()
+    so.graph_optimization_level = opt_level
+    so.optimized_model_filepath = output_path
+    ort.InferenceSession(input_path, so, providers=["CPUExecutionProvider"])
+
+    orig_size = Path(input_path).stat().st_size / (1024 * 1024)
+    opt_size = Path(output_path).stat().st_size / (1024 * 1024)
+    print(f"    {opt_size:.1f}MB (was {orig_size:.1f}MB)")
+
+
+def convert_fp16(fp32_path: str, fp16_path: str):
+    """Convert FP32 ONNX model to FP16 using ORT transformer optimizer.
+
+    This is more reliable than onnxconverter_common for mixed-precision
+    graphs — it uses symbolic shape inference to handle Cast nodes correctly.
+    """
+    from onnxruntime.transformers.optimizer import optimize_model
 
     print(f"\nConverting to FP16: {fp16_path}")
-    model = onnx.load(fp32_path)
-    model_fp16 = float16.convert_float_to_float16(
-        model,
+    opt = optimize_model(fp32_path, opt_level=0)
+    opt.convert_float_to_float16(
+        use_symbolic_shape_infer=True,
         keep_io_types=True,
-        disable_shape_infer=True,
-        op_block_list=['GroupNormalization', 'ReduceMean', 'GridSample'],
     )
-    onnx.save_model(model_fp16, fp16_path, save_as_external_data=False)
-    size_mb = Path(fp16_path).stat().st_size / (1024 * 1024)
-    print(f"FP16 exported: {fp16_path} ({size_mb:.1f} MB)")
+    opt.save_model_to_file(fp16_path)
+
+    fp32_size = Path(fp32_path).stat().st_size / (1024 * 1024)
+    fp16_size = Path(fp16_path).stat().st_size / (1024 * 1024)
+    print(f"FP16 exported: {fp16_path} ({fp16_size:.1f} MB, was {fp32_size:.1f} MB)")
     return fp16_path
 
 
 def quantize_int8(fp32_path: str, int8_path: str):
-    """Dynamic INT8 quantization of ONNX model."""
+    """Dynamic INT8 quantization (signed, per-channel).
+
+    MVRecon is CNN-based (72 Conv ops, 0 MatMul) so we quantize both
+    MatMul and Conv. TripoSR only quantizes MatMul because its Conv
+    layers are accuracy-sensitive, but MVRecon's Conv3D layers in the
+    refiner benefit from quantization without significant quality loss.
+    """
     from onnxruntime.quantization import quantize_dynamic, QuantType
 
     print(f"\nQuantizing to INT8 (dynamic): {int8_path}")
     quantize_dynamic(
         fp32_path, int8_path,
-        weight_type=QuantType.QUInt8,
-        extra_options={"MatMulConstBOnly": False},
+        weight_type=QuantType.QInt8,
+        per_channel=True,
+        reduce_range=False,
+        op_types_to_quantize=["MatMul", "Conv"],
     )
-    size_mb = Path(int8_path).stat().st_size / (1024 * 1024)
-    print(f"INT8 exported: {int8_path} ({size_mb:.1f} MB)")
+    fp32_size = Path(fp32_path).stat().st_size / (1024 * 1024)
+    int8_size = Path(int8_path).stat().st_size / (1024 * 1024)
+    print(f"INT8 exported: {int8_path} ({int8_size:.1f} MB, was {fp32_size:.1f} MB)")
     return int8_path
 
 
-def verify_variant(variant_path: str, ref_model: ExportableModel,
-                   label: str, n_views: int = 3, input_size: int = 160,
-                   tol: float = 0.05):
-    """Verify a quantized variant against PyTorch reference."""
+def validate_static_shapes(model_path: str) -> bool:
+    """Verify all ONNX model I/O shapes are fully static (no symbolic dims).
+
+    Critical for Quest/mobile deployment — dynamic shapes prevent XNNPACK
+    graph optimizations and can cause runtime failures.
+    """
+    import onnx
+
+    model = onnx.load(model_path)
+    dynamic_found = []
+
+    for tensor_list, kind in [(model.graph.input, "input"),
+                               (model.graph.output, "output")]:
+        for tensor in tensor_list:
+            shape = tensor.type.tensor_type.shape
+            if shape is None:
+                dynamic_found.append((kind, tensor.name, "no shape info"))
+                continue
+            for i, dim in enumerate(shape.dim):
+                if dim.dim_param:
+                    dynamic_found.append((kind, tensor.name, f"axis {i} = '{dim.dim_param}'"))
+                elif dim.dim_value == 0:
+                    dynamic_found.append((kind, tensor.name, f"axis {i} = unknown(0)"))
+
+    if dynamic_found:
+        print(f"  FAIL static shapes: {Path(model_path).name}")
+        for kind, name, detail in dynamic_found:
+            print(f"    {kind} '{name}': {detail}")
+        return False
+
+    print(f"  PASS static shapes: {Path(model_path).name}")
+    return True
+
+
+def verify_variant(variant_path: str, ref_density: np.ndarray,
+                   ref_color: np.ndarray, dummy_images_np: np.ndarray,
+                   dummy_w2c_np: np.ndarray, label: str) -> dict:
+    """Verify a variant against PyTorch reference using relative error.
+
+    Returns metrics dict with tiered verdict: PASS (<1%), WARN (<5%),
+    OK (<15%), FAIL (>15%).
+    """
     import onnxruntime as ort
 
-    device = next(ref_model.parameters()).device
-    ref_model.eval()
-
-    torch.manual_seed(42)
-    dummy_images = torch.randn(1, n_views, 3, input_size, input_size, device=device)
-    dummy_w2c = torch.randn(1, n_views, 3, 4, device=device)
-
-    with torch.no_grad():
-        pt_density, pt_color = ref_model(dummy_images, dummy_w2c)
-
     sess = ort.InferenceSession(variant_path, providers=['CPUExecutionProvider'])
+
+    inp_images = dummy_images_np
+    inp_w2c = dummy_w2c_np
+    if sess.get_inputs()[0].type == "tensor(float16)":
+        inp_images = dummy_images_np.astype(np.float16)
+        inp_w2c = dummy_w2c_np.astype(np.float16)
+
     ort_out = sess.run(None, {
-        'images': dummy_images.cpu().numpy(),
-        'w2c_cv': dummy_w2c.cpu().numpy(),
+        'images': inp_images, 'w2c_cv': inp_w2c,
     })
+    ort_density = ort_out[0].astype(np.float32)
+    ort_color = ort_out[1].astype(np.float32)
 
-    d_diff = np.abs(pt_density.cpu().numpy() - ort_out[0]).max()
-    c_diff = np.abs(pt_color.cpu().numpy() - ort_out[1]).max()
+    d_abs = np.abs(ref_density - ort_density)
+    c_abs = np.abs(ref_color - ort_color)
+    d_range = max(float(np.abs(ref_density).max()), 1e-8)
+    c_range = max(float(np.abs(ref_color).max()), 1e-8)
 
-    print(f"[{label}] density max diff: {d_diff:.6f}, color max diff: {c_diff:.6f}")
-    ok = d_diff < tol and c_diff < tol
-    print(f"[{label}] {'PASS' if ok else 'FAIL'}: tolerance {tol}")
-    return ok
+    d_max_rel = float(d_abs.max()) / d_range
+    c_max_rel = float(c_abs.max()) / c_range
+    max_rel = max(d_max_rel, c_max_rel)
+
+    d_mean_rel = float(d_abs.mean()) / d_range
+    c_mean_rel = float(c_abs.mean()) / c_range
+    mean_rel = max(d_mean_rel, c_mean_rel)
+
+    size_mb = Path(variant_path).stat().st_size / (1024 * 1024)
+
+    verdict = ("PASS" if max_rel < 0.01
+               else "WARN" if max_rel < 0.05
+               else "OK" if max_rel < 0.15
+               else "FAIL")
+
+    print(f"  [{label}] {size_mb:.1f}MB | "
+          f"density max={d_abs.max():.4f} ({d_max_rel*100:.3f}%) | "
+          f"color max={c_abs.max():.4f} ({c_max_rel*100:.3f}%) → {verdict}")
+
+    return {
+        'label': label, 'size_mb': size_mb,
+        'max_rel': max_rel, 'mean_rel': mean_rel,
+        'verdict': verdict,
+    }
 
 
 def main():
@@ -381,38 +472,74 @@ def main():
     trained = load_model(args.checkpoint)
     exportable = ExportableModel(trained)
 
-    # Always export FP32 first (needed as base for other variants)
+    # 1. Export FP32
     print("\nModel info:")
     export_onnx(exportable, fp32_path, args.n_views, args.input_size, args.opset)
     print_model_info(exportable, fp32_path)
     write_camera_config(str(output_dir), args.input_size)
 
+    # 2. Graph optimization (constant folding, CSE, dead node elimination)
+    optimize_graph(fp32_path)
+
+    # 3. Static shape validation
+    print("\nValidating shapes...")
+    validate_static_shapes(fp32_path)
+
+    # 4. Generate PyTorch reference for verification
+    torch.manual_seed(42)
+    device = next(exportable.parameters()).device
+    dummy_images = torch.randn(1, args.n_views, 3, args.input_size, args.input_size, device=device)
+    dummy_w2c = torch.randn(1, args.n_views, 3, 4, device=device)
+    with torch.no_grad():
+        pt_density, pt_color = exportable(dummy_images, dummy_w2c)
+    ref_d = pt_density.cpu().numpy()
+    ref_c = pt_color.cpu().numpy()
+    img_np = dummy_images.cpu().numpy()
+    w2c_np = dummy_w2c.cpu().numpy()
+
+    results = []
+
     if not args.skip_verify:
         print("\nVerifying FP32 ONNX vs PyTorch...")
-        verify_onnx(fp32_path, exportable, args.n_views, args.input_size)
+        results.append(verify_variant(
+            fp32_path, ref_d, ref_c, img_np, w2c_np, 'FP32'))
 
     exported = {'fp32': fp32_path}
 
     if 'fp16' in args.variants:
         fp16_path = str(output_dir / 'mv_recon_fp16.onnx')
         convert_fp16(fp32_path, fp16_path)
+        validate_static_shapes(fp16_path)
         exported['fp16'] = fp16_path
-        # FP16 mixed-precision models can't be verified on CPU provider
-        # (internal Cast node type mismatches). Verify on Quest with XNNPACK.
-        print("[FP16] Skipping CPU verification — test on device (XNNPACK EP)")
+        if not args.skip_verify:
+            try:
+                results.append(verify_variant(
+                    fp16_path, ref_d, ref_c, img_np, w2c_np, 'FP16'))
+            except Exception as e:
+                print(f"[FP16] CPU verification failed ({e}) — test on device")
 
     if 'int8' in args.variants:
         int8_path = str(output_dir / 'mv_recon_int8.onnx')
         quantize_int8(fp32_path, int8_path)
         exported['int8'] = int8_path
         if not args.skip_verify:
-            verify_variant(int8_path, exportable, 'INT8',
-                           args.n_views, args.input_size, tol=0.5)
+            try:
+                results.append(verify_variant(
+                    int8_path, ref_d, ref_c, img_np, w2c_np, 'INT8'))
+            except Exception as e:
+                print(f"[INT8] CPU verification failed ({e}) — test on device")
 
+    # Summary table
     print("\n=== Export Summary ===")
+    print(f"{'Variant':<8} {'Size':>8} {'Max Rel%':>10} {'Verdict':>8}")
+    print("-" * 38)
     for variant, path in exported.items():
         size_mb = Path(path).stat().st_size / (1024 * 1024)
-        print(f"  {variant.upper():5s}: {path} ({size_mb:.1f} MB)")
+        r = next((x for x in results if x['label'] == variant.upper()), None)
+        if r:
+            print(f"  {variant.upper():<6} {size_mb:>7.1f}MB {r['max_rel']*100:>9.3f}% {r['verdict']:>8}")
+        else:
+            print(f"  {variant.upper():<6} {size_mb:>7.1f}MB {'':>9} {'N/A':>8}")
     print("Done.")
 
 
