@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 from torchvision import transforms
 from PIL import Image
@@ -36,15 +37,21 @@ class ObjaverseMultiViewDataset(Dataset):
     def __init__(self, renders_dir: str, uids: list[str],
                  n_input_views: int = 4, n_sup_views: int = 8,
                  image_size: int = 160, sup_image_size: int = 128,
-                 augment: bool = False, voxels_dir: str | None = None):
+                 augment: bool = False, voxels_dir: str | None = None,
+                 n_input_views_min: int | None = None,
+                 n_input_views_max: int | None = None,
+                 surface_weight: float = 1.0):
         self.renders_dir = Path(renders_dir)
         self.uids = uids
         self.n_input_views = n_input_views
+        self.n_input_views_min = n_input_views_min
+        self.n_input_views_max = n_input_views_max
         self.n_sup_views = n_sup_views
         self.image_size = image_size
         self.sup_image_size = sup_image_size
         self.augment = augment
         self.voxels_dir = Path(voxels_dir) if voxels_dir else None
+        self.surface_weight = surface_weight
 
         self.imagenet_normalize = transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)
 
@@ -109,10 +116,16 @@ class ObjaverseMultiViewDataset(Dataset):
         n_total = len(cams)
 
         # Randomly select input and supervision views (reshuffled every call)
+        if self.n_input_views_min is not None and self.n_input_views_max is not None:
+            n_in = random.randint(self.n_input_views_min, self.n_input_views_max)
+        else:
+            n_in = self.n_input_views
+        n_in = min(n_in, n_total)
+
         indices = list(range(n_total))
         random.shuffle(indices)
-        input_indices = indices[:self.n_input_views]
-        remaining = indices[self.n_input_views:]
+        input_indices = indices[:n_in]
+        remaining = indices[n_in:]
         sup_indices = remaining[:self.n_sup_views] if len(remaining) >= self.n_sup_views else remaining
 
         # Per-sample augmentation decisions (consistent across all views)
@@ -202,5 +215,13 @@ class ObjaverseMultiViewDataset(Dataset):
                 if do_hflip:
                     gt_tensor = gt_tensor.flip(-1)  # flip X axis (last dim in ZYX layout)
                 result['gt_occupancy'] = gt_tensor
+
+                if self.surface_weight > 1.0:
+                    gt_bin = (gt_tensor > 0.5).float()
+                    inv = (1.0 - gt_bin).unsqueeze(0).unsqueeze(0)  # [1,1,D,D,D]
+                    near_empty = F.max_pool3d(inv, kernel_size=3, stride=1, padding=1)
+                    is_surface = gt_bin * near_empty.squeeze(0).squeeze(0)
+                    sw = 1.0 + is_surface * (self.surface_weight - 1.0)
+                    result['surface_weight'] = sw
 
         return result

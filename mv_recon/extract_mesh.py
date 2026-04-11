@@ -347,8 +347,8 @@ def main():
     parser.add_argument('--image_size', type=int, default=160)
     parser.add_argument('--n_input_views', type=int, default=4)
     parser.add_argument('--output_dir', type=str, default='output/mv_recon_overfit')
-    parser.add_argument('--mc_threshold', type=float, default=0.7,
-                        help='Marching cubes threshold (higher = less noise)')
+    parser.add_argument('--mc_threshold', type=float, default=0.5,
+                        help='Marching cubes threshold (0.5=natural boundary, higher=less noise but loses thin structures)')
     parser.add_argument('--uids', type=str, default=None,
                         help='Comma-separated UIDs or JSON array (overrides --mode)')
     parser.add_argument('--meshes_out', type=str, default=None,

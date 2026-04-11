@@ -163,14 +163,14 @@ def load_model(checkpoint_path: str, device: str = 'cpu',
 def export_onnx(model: ExportableModel, output_path: str,
                 n_views: int = 3, input_size: int = 160,
                 opset: int = 21):
-    """Export to ONNX with fixed shapes."""
+    """Export to ONNX with dynamic view count (axis 1 of images and w2c)."""
     model.eval()
     device = next(model.parameters()).device
 
     dummy_images = torch.randn(1, n_views, 3, input_size, input_size, device=device)
     dummy_w2c = torch.randn(1, n_views, 3, 4, device=device)
 
-    print(f"Exporting ONNX (opset {opset}, N={n_views}, size={input_size})...")
+    print(f"Exporting ONNX (opset {opset}, N={n_views}, size={input_size}, dynamic views)...")
 
     torch.onnx.export(
         model,
@@ -179,7 +179,10 @@ def export_onnx(model: ExportableModel, output_path: str,
         opset_version=opset,
         input_names=['images', 'w2c_cv'],
         output_names=['density', 'color'],
-        dynamic_axes=None,  # fixed shapes for Quest deployment
+        dynamic_axes={
+            'images': {1: 'num_views'},
+            'w2c_cv': {1: 'num_views'},
+        },
     )
 
     # Ensure all weights are embedded (torch may create .data sidecar)

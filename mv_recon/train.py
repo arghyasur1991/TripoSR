@@ -135,14 +135,15 @@ def compute_loss(model: MVReconModel, batch: dict,
                  n_samples: int = 64, n_rays_per_view: int = 512,
                  sup_image_size: int = 128,
                  w_photo: float = 1.0, w_mask: float = 0.1,
-                 w_bce: float = 1.0, w_sparse: float = 0.1,
+                 w_bce: float = 1.0, w_sparse: float = 0.05,
+                 loss_type: str = 'bce',
+                 pos_weight_cap: float = 0.0,
                  focal_gamma: float = 2.0, focal_alpha: float = 0.75,
                  ) -> tuple[torch.Tensor, dict]:
-    """Hybrid loss: photometric + mask + 3D focal BCE + sparsity.
+    """Hybrid loss: photometric + mask + 3D occupancy + sparsity.
 
-    Photometric and mask losses use the learned color volume for gradients.
-    Focal BCE provides geometry supervision without over-prediction bias.
-    Sparsity loss penalizes over-prediction of occupied voxels.
+    loss_type='bce': pos_weighted BCE (pos_weight_cap=0 means uncapped).
+    loss_type='focal': focal loss with gamma/alpha params.
     """
     input_imgs = batch['input_images'].to(device)    # [B, V_in, 3, H, W]
     input_c2w = batch['input_c2w'].to(device)        # [B, V_in, 4, 4]
@@ -174,15 +175,33 @@ def compute_loss(model: MVReconModel, batch: dict,
     photo_loss = total_photo / B
     mask_loss = total_mask / B
 
-    # Direct 3D focal BCE loss — model outputs 64^3, GT is 64^3
+    # Direct 3D occupancy loss — model outputs 64^3, GT is 64^3
     bce_loss = torch.tensor(0.0, device=device)
     iou_val = 0.0
     pred_logits = density[:, 0]                      # [B, 64, 64, 64]
     if 'gt_occupancy' in batch:
         gt_occ = batch['gt_occupancy'].to(device)    # [B, 64, 64, 64]
 
-        bce_loss = focal_bce_loss(pred_logits, gt_occ,
-                                  gamma=focal_gamma, alpha=focal_alpha)
+        if loss_type == 'focal':
+            bce_loss = focal_bce_loss(pred_logits, gt_occ,
+                                      gamma=focal_gamma, alpha=focal_alpha)
+        else:
+            n_pos = gt_occ.sum().clamp(min=1.0)
+            n_neg = (1 - gt_occ).sum().clamp(min=1.0)
+            pw = n_neg / n_pos
+            if pos_weight_cap > 0:
+                pw = pw.clamp(max=pos_weight_cap)
+            if 'surface_weight' in batch:
+                sw = batch['surface_weight'].to(device)
+                per_voxel = F.binary_cross_entropy_with_logits(
+                    pred_logits, gt_occ, pos_weight=pw, reduction='none',
+                )
+                bce_loss = (per_voxel * sw).mean()
+            else:
+                bce_loss = F.binary_cross_entropy_with_logits(
+                    pred_logits, gt_occ, pos_weight=pw,
+                )
+
         with torch.no_grad():
             iou_val = _iou(torch.sigmoid(pred_logits) > 0.5,
                            gt_occ > 0.5).item()
@@ -213,18 +232,21 @@ def _iou(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
 @torch.no_grad()
 def validate(model: MVReconModel, val_loader: DataLoader,
              device: torch.device, K_sup: torch.Tensor,
-             args) -> dict:
+             args, w_sparse_override: float | None = None) -> dict:
     """Run validation loop, return mean metrics."""
     model.eval()
     totals = {}
     n = 0
+    w_sp = w_sparse_override if w_sparse_override is not None else args.w_sparse
     for batch in val_loader:
         _, metrics = compute_loss(
             model, batch, device, K_sup=K_sup,
             n_samples=args.n_samples,
             n_rays_per_view=args.n_rays_per_view,
             sup_image_size=args.sup_image_size,
-            w_sparse=args.w_sparse,
+            w_sparse=w_sp,
+            loss_type=args.loss_type,
+            pos_weight_cap=args.pos_weight_cap,
             focal_gamma=args.focal_gamma,
             focal_alpha=args.focal_alpha,
         )
@@ -265,6 +287,9 @@ def train(args):
         sup_image_size=args.sup_image_size,
         augment=args.augment if args.augment is not None else (args.mode != 'overfit'),
         voxels_dir=voxels_dir,
+        n_input_views_min=args.n_input_views_min,
+        n_input_views_max=args.n_input_views_max,
+        surface_weight=args.surface_weight,
     )
     train_loader = DataLoader(
         train_ds, batch_size=1, shuffle=True,
@@ -283,6 +308,9 @@ def train(args):
             image_size=args.image_size,
             sup_image_size=args.sup_image_size,
             voxels_dir=voxels_dir,
+            n_input_views_min=args.n_input_views_min,
+            n_input_views_max=args.n_input_views_max,
+            surface_weight=args.surface_weight,
         )
         val_loader = DataLoader(
             val_ds, batch_size=1, shuffle=False,
@@ -382,12 +410,18 @@ def train(args):
 
     # --- Training loop ---
     grad_accum = args.grad_accum
+    sparse_start = args.w_sparse
+    sparse_end = args.w_sparse_end if args.w_sparse_end is not None else sparse_start
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         epoch_loss = 0.0
         epoch_metrics = {}
         n_batches = 0
         t0 = time.time()
+
+        # Cosine decay for sparsity weight: high early (cleans noise), low late (preserves thin structures)
+        progress = (epoch - 1) / max(args.epochs - 1, 1)
+        w_sparse_cur = sparse_end + 0.5 * (sparse_start - sparse_end) * (1 + math.cos(math.pi * progress))
 
         optimizer.zero_grad()
         for step, batch in enumerate(train_loader):
@@ -397,7 +431,9 @@ def train(args):
                 n_samples=args.n_samples,
                 n_rays_per_view=args.n_rays_per_view,
                 sup_image_size=args.sup_image_size,
-                w_sparse=args.w_sparse,
+                w_sparse=w_sparse_cur,
+                loss_type=args.loss_type,
+                pos_weight_cap=args.pos_weight_cap,
                 focal_gamma=args.focal_gamma,
                 focal_alpha=args.focal_alpha,
             )
@@ -430,7 +466,8 @@ def train(args):
         # --- Validation ---
         val_metrics = {}
         if val_loader and (epoch % args.val_every == 0 or epoch == 1):
-            val_metrics = validate(model, val_loader, device, K_sup, args)
+            val_metrics = validate(model, val_loader, device, K_sup, args,
+                                   w_sparse_override=w_sparse_cur)
             val_iou = val_metrics.get('iou', 0)
             if val_iou > best_val_iou:
                 best_val_iou = val_iou
@@ -466,12 +503,15 @@ def train(args):
         log_entries.append(entry)
 
         if epoch % args.log_every == 0 or epoch == 1:
+            sp_info = f"sp={avg_metrics.get('sparse', 0):.4f}"
+            if sparse_start != sparse_end:
+                sp_info += f"(w={w_sparse_cur:.3f})"
             print(f"[Epoch {epoch:4d}/{args.epochs}] "
                   f"loss={avg_loss:.4f} "
                   f"photo={avg_metrics.get('photo', 0):.4f} "
                   f"mask={avg_metrics.get('mask', 0):.4f} "
                   f"bce={avg_metrics.get('bce', 0):.4f} "
-                  f"sp={avg_metrics.get('sparse', 0):.4f} "
+                  f"{sp_info} "
                   f"iou={avg_metrics.get('iou', 0):.4f} "
                   f"lr={scheduler.get_last_lr()[0]:.2e} "
                   f"({epoch_time:.1f}s)")
@@ -515,6 +555,10 @@ def main():
     parser.add_argument('--image_size', type=int, default=160)
     parser.add_argument('--sup_image_size', type=int, default=128)
     parser.add_argument('--n_input_views', type=int, default=4)
+    parser.add_argument('--n_input_views_min', type=int, default=None,
+                        help='Min input views for variable-view training (None=fixed)')
+    parser.add_argument('--n_input_views_max', type=int, default=None,
+                        help='Max input views for variable-view training (None=fixed)')
     parser.add_argument('--n_sup_views', type=int, default=4)
     parser.add_argument('--n_samples', type=int, default=64)
     parser.add_argument('--n_rays_per_view', type=int, default=1024)
@@ -540,12 +584,20 @@ def main():
                         help='Linear LR warmup epochs before cosine decay')
     parser.add_argument('--augment', action='store_true', default=None,
                         help='Force augmentation on (default: off for overfit, on for full)')
-    parser.add_argument('--w_sparse', type=float, default=0.1,
-                        help='Sparsity loss weight (penalizes mean occupancy)')
+    parser.add_argument('--w_sparse', type=float, default=0.05,
+                        help='Sparsity loss weight (start value if scheduling)')
+    parser.add_argument('--w_sparse_end', type=float, default=None,
+                        help='Sparsity weight at end of training (cosine decay from w_sparse). None=constant.')
+    parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
+                        help='Occupancy loss: bce (pos-weighted) or focal')
+    parser.add_argument('--pos_weight_cap', type=float, default=0.0,
+                        help='Cap pos_weight for BCE (0=uncapped, old default was 20)')
     parser.add_argument('--focal_gamma', type=float, default=2.0,
                         help='Focal loss gamma (higher = more focus on hard examples)')
     parser.add_argument('--focal_alpha', type=float, default=0.75,
                         help='Focal loss alpha (positive class weight, 0.5=balanced)')
+    parser.add_argument('--surface_weight', type=float, default=1.0,
+                        help='Extra weight for surface voxels in BCE (1.0=off, 3.0=3x for surface)')
     args = parser.parse_args()
     train(args)
 
